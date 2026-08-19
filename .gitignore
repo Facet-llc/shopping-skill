@@ -1,0 +1,18 @@
+# The skill reads identity, keys, and tokens from the environment and never
+# stores them here. These patterns are defense in depth so a stray secret can
+# never be committed by accident.
+*.env
+.env
+.env.*
+*.key
+*.pem
+*.jwt
+*secret*
+# The self-serve KYA cache lives in ~/.cache/facet, never in the skill dir, but
+# guard the pattern anyway.
+kya-*.jwt
+
+# OS and editor cruft
+.DS_Store
+*.log
+*.swp

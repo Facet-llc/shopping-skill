@@ -1,0 +1,7 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/Facet-llc/shopping-skill/security/advisories/new
+    about: >-
+      Do not open a public issue for a security vulnerability. This skill moves
+      real funds; please report privately here or per SECURITY.md.
