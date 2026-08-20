@@ -989,6 +989,19 @@ export const TOOLS: ToolDef[] = [
     perms: facetPerms,
     build: () => ["receipts"],
   },
+  {
+    name: "facet_version",
+    description: "Confirm the installed skill against the latest GA release. Reads the newest " +
+      "published tag from the public GA repository's GitHub API (Facet-llc/shopping-skill) and " +
+      "compares it to this build's version, returning `version`, `latest`, `up_to_date`, and a " +
+      "human `message`, plus an `update_url` when a newer release exists. Read-only: no wallet, no " +
+      "KYA, no secret; a GitHub outage reports `up_to_date: null` (unknown), never an error. Use " +
+      "when the user asks whether the skill is up to date or on the latest version.",
+    inputSchema: obj({}),
+    script: "facet-checkout.ts",
+    perms: facetPerms,
+    build: () => ["version"],
+  },
 ];
 
 // ---- the child runner (the secret choke point) -----------------------------

@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-08-20
+
+### Added
+
+- Version check against the GA release. A new `version` subcommand (and `facet_version`
+  MCP tool) reads the newest tag from the public GA repository's GitHub API
+  (`Facet-llc/shopping-skill`) and compares it to this build, so a user can confirm they
+  are on the latest GA release: it returns `version`, `latest`, `up_to_date`, a human
+  `message`, and an `update_url` when a newer release exists. Read-only (no wallet, no
+  KYA, no secret), and a GitHub outage reports `up_to_date: null` (unknown) rather than
+  failing. `SKILL_VERSION` in `scripts/version.ts` is the single source of truth for the
+  build version; an offline test asserts it matches the newest dated CHANGELOG section, so
+  a release cannot bump the tag without the version.
+
 ## [1.2.0] - 2026-08-20
 
 ### Added

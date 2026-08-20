@@ -46,6 +46,7 @@ const EXPECTED_TOOLS = [
   "facet_render_receipt",
   "facet_lifecycle_receipt",
   "facet_receipts",
+  "facet_version",
 ];
 
 const SCRIPT_DIR = new URL(".", import.meta.url).pathname;
@@ -627,6 +628,12 @@ Deno.test("facet_receipts builds the no-argument receipts subcommand", () => {
   const tool = TOOLS.find((t) => t.name === "facet_receipts");
   assert(tool !== undefined, "facet_receipts is not registered");
   assertEquals(tool.build!({}), ["receipts"]);
+});
+
+Deno.test("facet_version builds the no-argument version subcommand", () => {
+  const tool = TOOLS.find((t) => t.name === "facet_version");
+  assert(tool !== undefined, "facet_version is not registered");
+  assertEquals(tool.build!({}), ["version"]);
 });
 
 // ---- 8. per-line Boson escrow (the in-process set tools) -------------------

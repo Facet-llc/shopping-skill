@@ -97,6 +97,7 @@ import { charge as mppEvmCharge } from "npm:mppx@0.8.17/evm/client";
 import { Challenge as MppChallenge, Receipt as MppReceipt } from "npm:mppx@0.8.17";
 import { cachePathFor, kyaUsable, provisionKya, readCachedKya } from "./kya-provision.ts";
 import { fillReceiptTemplate, merchantNameFromHost, pubkeyXForKid } from "./render-receipt.ts";
+import { latestTag, SKILL_TAGS_URL, SKILL_VERSION, versionReport } from "./version.ts";
 import {
   attachShippingEmail,
   getShippingEmailPref,
@@ -4331,6 +4332,23 @@ async function cmdReceipts(_flags: Record<string, string | boolean>): Promise<ne
   emit({ ok: true, receipts_dir: dir, count: receipts.length, receipts });
 }
 
+// ---- version: confirm the installed skill against the latest GA release --------
+// Reads the newest tag from the public GA repo's GitHub API and compares it against
+// this build's SKILL_VERSION, so a user can confirm they are current. Read-only, no
+// wallet or KYA; a network failure is reported as "unknown", never an error.
+async function cmdVersion(_flags: Record<string, string | boolean>): Promise<never> {
+  let latest: string | null = null;
+  try {
+    const r = await fetch(SKILL_TAGS_URL, {
+      headers: { "accept": "application/vnd.github+json", "user-agent": "facet-shopping-skill" },
+    });
+    if (r.ok) latest = latestTag(await r.json());
+  } catch {
+    // Offline or GitHub unreachable: latest stays null, reported as "unknown" below.
+  }
+  emit({ ok: true, ...versionReport(SKILL_VERSION, latest) });
+}
+
 // ---- receipt subcommand: fetch + verify a settled order's proof ------------
 async function cmdReceipt(flags: Record<string, string | boolean>): Promise<never> {
   const base = terminalBase(requireFlag(flags, "terminal"));
@@ -4468,12 +4486,15 @@ if (import.meta.main) {
       case "lifecycle-receipt":
         await cmdLifecycleReceipt(flags);
         break;
+      case "version":
+        await cmdVersion(flags);
+        break;
       default:
         die(
           `unknown subcommand "${cmd}". Use: wallet new | wallets | fund | discover | directory | ` +
             `search | product | provision | buy | mpp-charge | email-pref | redeem | cancel | withdraw | ` +
             `dispute | refund | resolve | reorder | revise | receipt | render-receipt | receipts | ` +
-            `lifecycle-receipt.`,
+            `lifecycle-receipt | version.`,
         );
     }
   } catch (e) {
