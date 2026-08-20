@@ -9,7 +9,15 @@
 //      can never reach a tool result.
 
 import { assert, assertEquals, assertStringIncludes } from "jsr:@std/assert@^1";
-import { executeTool, handleMessage, spawnCaptureStdout, TOOLS } from "./mcp-server.ts";
+import {
+  executeTool,
+  handleMessage,
+  normalizeExchangeIds,
+  perLineBodyKey,
+  planPerLineEscrowAction,
+  spawnCaptureStdout,
+  TOOLS,
+} from "./mcp-server.ts";
 import { addressFromPrivateKey, mintWallet } from "./wallet.ts";
 
 const EXPECTED_TOOLS = [
@@ -22,17 +30,20 @@ const EXPECTED_TOOLS = [
   "facet_search",
   "facet_product",
   "facet_buy",
+  "facet_mpp_charge",
   "facet_email_pref",
   "facet_browse_storefront",
   "facet_redeem",
   "facet_cancel",
   "facet_withdraw",
   "facet_dispute",
+  "facet_lines",
   "facet_refund",
   "facet_resolve",
   "facet_reorder",
   "facet_revise",
   "facet_get_receipt",
+  "facet_render_receipt",
   "facet_lifecycle_receipt",
   "facet_receipts",
 ];
@@ -233,7 +244,7 @@ Deno.test("tool table is internally consistent", () => {
 Deno.test("facet_withdraw builds the withdraw subcommand argv", () => {
   const tool = TOOLS.find((t) => t.name === "facet_withdraw");
   assert(tool !== undefined, "facet_withdraw is not registered");
-  const argv = tool.build({
+  const argv = tool.build!({
     terminal: "https://pecanandpetal.facet.llc",
     exchange_id: "42",
     wallet: "default",
@@ -258,7 +269,7 @@ Deno.test("facet_withdraw omits optional flags and requires terminal + exchange_
   const tool = TOOLS.find((t) => t.name === "facet_withdraw");
   assert(tool !== undefined, "facet_withdraw is not registered");
   // Minimal call: no wallet, no amount, no dry_run.
-  assertEquals(tool.build({ terminal: "https://x.facet.llc", exchange_id: "7" }), [
+  assertEquals(tool.build!({ terminal: "https://x.facet.llc", exchange_id: "7" }), [
     "withdraw",
     "--terminal",
     "https://x.facet.llc",
@@ -268,18 +279,71 @@ Deno.test("facet_withdraw omits optional flags and requires terminal + exchange_
   // exchange_id is required.
   let threw = false;
   try {
-    tool.build({ terminal: "https://x.facet.llc" });
+    tool.build!({ terminal: "https://x.facet.llc" });
   } catch {
     threw = true;
   }
   assert(threw, "facet_withdraw must require exchange_id");
 });
 
+// ---- 6b. the MPP charge wiring maps to the CLI subcommand ------------------
+
+Deno.test("facet_mpp_charge builds the mpp-charge subcommand argv (full settle)", () => {
+  const tool = TOOLS.find((t) => t.name === "facet_mpp_charge");
+  assert(tool !== undefined, "facet_mpp_charge is not registered");
+  const argv = tool.build!({
+    terminal: "https://pecanandpetal.facet.llc",
+    reservation_id: "chk_abc123",
+    wallet: "default",
+    settle: true,
+    confirm: "2524000",
+    confirm_pay_to: "0x0be0574bd5fbd20e6187e6f3b6a889791699ccc3",
+    max_usdc: 25,
+  });
+  assertEquals(argv, [
+    "mpp-charge",
+    "--terminal",
+    "https://pecanandpetal.facet.llc",
+    "--reservation-id",
+    "chk_abc123",
+    "--wallet",
+    "default",
+    "--settle",
+    "--confirm",
+    "2524000",
+    "--confirm-pay-to",
+    "0x0be0574bd5fbd20e6187e6f3b6a889791699ccc3",
+    "--max-usdc",
+    "25",
+  ]);
+});
+
+Deno.test("facet_mpp_charge omits optional flags and requires terminal + reservation_id", () => {
+  const tool = TOOLS.find((t) => t.name === "facet_mpp_charge");
+  assert(tool !== undefined, "facet_mpp_charge is not registered");
+  // Minimal DRY call: no wallet, no settle, no confirm.
+  assertEquals(tool.build!({ terminal: "https://x.facet.llc", reservation_id: "r1" }), [
+    "mpp-charge",
+    "--terminal",
+    "https://x.facet.llc",
+    "--reservation-id",
+    "r1",
+  ]);
+  // reservation_id is required.
+  let threw = false;
+  try {
+    tool.build!({ terminal: "https://x.facet.llc" });
+  } catch {
+    threw = true;
+  }
+  assert(threw, "facet_mpp_charge must require reservation_id");
+});
+
 Deno.test("facet_lifecycle_receipt builds the argv for an exchange-handled reversal", () => {
   const tool = TOOLS.find((t) => t.name === "facet_lifecycle_receipt");
   assert(tool !== undefined, "facet_lifecycle_receipt is not registered");
   assertEquals(
-    tool.build({
+    tool.build!({
       terminal: "https://pecanandpetal.facet.llc",
       kind: "cancel",
       exchange_id: "42",
@@ -303,7 +367,7 @@ Deno.test("facet_lifecycle_receipt takes an order handle for a refund and requir
   const tool = TOOLS.find((t) => t.name === "facet_lifecycle_receipt");
   assert(tool !== undefined, "facet_lifecycle_receipt is not registered");
   assertEquals(
-    tool.build({ terminal: "https://x.facet.llc", kind: "refund", order_id: "ord-9" }),
+    tool.build!({ terminal: "https://x.facet.llc", kind: "refund", order_id: "ord-9" }),
     [
       "lifecycle-receipt",
       "--terminal",
@@ -317,7 +381,7 @@ Deno.test("facet_lifecycle_receipt takes an order handle for a refund and requir
   // kind is required.
   let threw = false;
   try {
-    tool.build({ terminal: "https://x.facet.llc" });
+    tool.build!({ terminal: "https://x.facet.llc" });
   } catch {
     threw = true;
   }
@@ -328,7 +392,7 @@ Deno.test("facet_revise builds the cancel-and-rebuy planner argv with a kept-ite
   const tool = TOOLS.find((t) => t.name === "facet_revise");
   assert(tool !== undefined, "facet_revise is not registered");
   assertEquals(
-    tool.build({
+    tool.build!({
       terminal: "https://pecanandpetal.facet.llc",
       exchange_id: "18",
       keep: [{ id: "HCF-BDAY", qty: 1 }],
@@ -349,7 +413,7 @@ Deno.test("facet_revise builds the cancel-and-rebuy planner argv with a kept-ite
   // exchange_id and keep are required.
   let threw = false;
   try {
-    tool.build({ terminal: "https://x.facet.llc" });
+    tool.build!({ terminal: "https://x.facet.llc" });
   } catch {
     threw = true;
   }
@@ -360,7 +424,7 @@ Deno.test("facet_cancel --withdraw chains the cash-out via one boolean flag", ()
   const tool = TOOLS.find((t) => t.name === "facet_cancel");
   assert(tool !== undefined, "facet_cancel is not registered");
   // Plain cancel: no --withdraw appended.
-  assertEquals(tool.build({ terminal: "https://x.facet.llc", exchange_id: "7" }), [
+  assertEquals(tool.build!({ terminal: "https://x.facet.llc", exchange_id: "7" }), [
     "cancel",
     "--terminal",
     "https://x.facet.llc",
@@ -369,7 +433,7 @@ Deno.test("facet_cancel --withdraw chains the cash-out via one boolean flag", ()
   ]);
   // cancel then withdraw, with an amount override.
   assertEquals(
-    tool.build({
+    tool.build!({
       terminal: "https://x.facet.llc",
       exchange_id: "7",
       withdraw: true,
@@ -393,7 +457,7 @@ Deno.test("facet_refund builds the refund argv with reason and an optional parti
   assert(tool !== undefined, "facet_refund is not registered");
   // Whole-order refund: reason required, no items flag.
   assertEquals(
-    tool.build({ terminal: "https://x.facet.llc", order_id: "ord-1", reason: "changed my mind" }),
+    tool.build!({ terminal: "https://x.facet.llc", order_id: "ord-1", reason: "changed my mind" }),
     [
       "refund",
       "--terminal",
@@ -406,7 +470,7 @@ Deno.test("facet_refund builds the refund argv with reason and an optional parti
   );
   // Partial refund: the items array is serialized to a --items JSON flag.
   assertEquals(
-    tool.build({
+    tool.build!({
       terminal: "https://x.facet.llc",
       order_id: "ord-1",
       reason: "arrived wilted",
@@ -427,7 +491,7 @@ Deno.test("facet_refund builds the refund argv with reason and an optional parti
   // reason is required.
   let threw = false;
   try {
-    tool.build({ terminal: "https://x.facet.llc", order_id: "ord-1" });
+    tool.build!({ terminal: "https://x.facet.llc", order_id: "ord-1" });
   } catch {
     threw = true;
   }
@@ -438,10 +502,10 @@ Deno.test("facet_fund builds the fund subcommand argv", () => {
   const tool = TOOLS.find((t) => t.name === "facet_fund");
   assert(tool !== undefined, "facet_fund is not registered");
   // One-shot balance check: no await, no minimum.
-  assertEquals(tool.build({}), ["fund"]);
+  assertEquals(tool.build!({}), ["fund"]);
   // Labeled wallet, poll until a minimum balance is reached.
   assertEquals(
-    tool.build({ label: "business", min_usdc: 25, await_funding: true }),
+    tool.build!({ label: "business", min_usdc: 25, await_funding: true }),
     ["fund", "--label", "business", "--min-usdc", "25", "--await"],
   );
 });
@@ -450,18 +514,18 @@ Deno.test("facet_email_pref builds show, opt-in, and opt-out argv", () => {
   const tool = TOOLS.find((t) => t.name === "facet_email_pref");
   assert(tool !== undefined, "facet_email_pref is not registered");
   // show prints the current preference.
-  assertEquals(tool.build({ action: "show" }), ["email-pref", "show"]);
+  assertEquals(tool.build!({ action: "show" }), ["email-pref", "show"]);
   // opt in: the address is a positional after set, not a --flag.
   assertEquals(
-    tool.build({ action: "set", address: "throwaway@example.com" }),
+    tool.build!({ action: "set", address: "throwaway@example.com" }),
     ["email-pref", "set", "throwaway@example.com"],
   );
   // opt out: --none, no address.
-  assertEquals(tool.build({ action: "set", none: true }), ["email-pref", "set", "--none"]);
+  assertEquals(tool.build!({ action: "set", none: true }), ["email-pref", "set", "--none"]);
   // set without an address or none is rejected.
   let threw = false;
   try {
-    tool.build({ action: "set" });
+    tool.build!({ action: "set" });
   } catch {
     threw = true;
   }
@@ -469,7 +533,7 @@ Deno.test("facet_email_pref builds show, opt-in, and opt-out argv", () => {
   // action is required.
   let threwAction = false;
   try {
-    tool.build({});
+    tool.build!({});
   } catch {
     threwAction = true;
   }
@@ -481,12 +545,12 @@ Deno.test("facet_resolve builds the resolve argv for both the auto and explicit 
   assert(tool !== undefined, "facet_resolve is not registered");
   // Auto-fetch: just the refund_id (the offer is read from the buyer's own ticket).
   assertEquals(
-    tool.build({ terminal: "https://x.facet.llc", refund_id: "refund-1" }),
+    tool.build!({ terminal: "https://x.facet.llc", refund_id: "refund-1" }),
     ["resolve", "--terminal", "https://x.facet.llc", "--refund-id", "refund-1"],
   );
   // Explicit offer: exchange_id + buyer_percent_bps (a number, coerced) + seller_sig.
   assertEquals(
-    tool.build({
+    tool.build!({
       terminal: "https://x.facet.llc",
       exchange_id: "42",
       buyer_percent_bps: 1140,
@@ -510,7 +574,7 @@ Deno.test("facet_resolve builds the resolve argv for both the auto and explicit 
   // terminal is required.
   let threw = false;
   try {
-    tool.build({ refund_id: "refund-1" });
+    tool.build!({ refund_id: "refund-1" });
   } catch {
     threw = true;
   }
@@ -524,7 +588,7 @@ Deno.test("facet_get_receipt builds the receipt subcommand argv", () => {
   assert(tool !== undefined, "facet_get_receipt is not registered");
   // Full call with the offline check skipped.
   assertEquals(
-    tool.build({
+    tool.build!({
       terminal: "https://pecanandpetal.facet.llc",
       order_id: "bcd5ffa9-3d57-4749-9d0a-4a84a2c60137",
       no_verify: true,
@@ -542,7 +606,7 @@ Deno.test("facet_get_receipt builds the receipt subcommand argv", () => {
     ],
   );
   // Minimal call: no wallet, verify on.
-  assertEquals(tool.build({ terminal: "https://x.facet.llc", order_id: "7" }), [
+  assertEquals(tool.build!({ terminal: "https://x.facet.llc", order_id: "7" }), [
     "receipt",
     "--terminal",
     "https://x.facet.llc",
@@ -552,7 +616,7 @@ Deno.test("facet_get_receipt builds the receipt subcommand argv", () => {
   // order_id is required.
   let threw = false;
   try {
-    tool.build({ terminal: "https://x.facet.llc" });
+    tool.build!({ terminal: "https://x.facet.llc" });
   } catch {
     threw = true;
   }
@@ -562,5 +626,118 @@ Deno.test("facet_get_receipt builds the receipt subcommand argv", () => {
 Deno.test("facet_receipts builds the no-argument receipts subcommand", () => {
   const tool = TOOLS.find((t) => t.name === "facet_receipts");
   assert(tool !== undefined, "facet_receipts is not registered");
-  assertEquals(tool.build({}), ["receipts"]);
+  assertEquals(tool.build!({}), ["receipts"]);
+});
+
+// ---- 8. per-line Boson escrow (the in-process set tools) -------------------
+// The pure validators are exercised directly; the runners are exercised only
+// through their validation short-circuit, which returns BEFORE any wallet or
+// network access, so these tests need no key, no keychain, and no mocked RPC and
+// they never weaken the secret invariant.
+
+Deno.test("normalizeExchangeIds accepts an array or a comma string and dedupes in order", () => {
+  // A native array: deduped preserving first-seen order, empties dropped.
+  assertEquals(normalizeExchangeIds(["e1", "e2", "e1", "  ", "e3"]), ["e1", "e2", "e3"]);
+  // A comma-separated string: trimmed and deduped the same way.
+  assertEquals(normalizeExchangeIds(" e1 , e2 ,e1, ,e3 "), ["e1", "e2", "e3"]);
+  // Neither an array nor a string is an empty set.
+  assertEquals(normalizeExchangeIds(undefined), []);
+  assertEquals(normalizeExchangeIds(42), []);
+  // A string of only separators and whitespace normalizes to empty.
+  assertEquals(normalizeExchangeIds(" , , "), []);
+});
+
+Deno.test("perLineBodyKey maps each kind to its Terminal set-body key", () => {
+  assertEquals(perLineBodyKey("redeem"), "redeem_line_items");
+  assertEquals(perLineBodyKey("cancel"), "cancel_line_items");
+  assertEquals(perLineBodyKey("dispute"), "dispute_line_items");
+});
+
+Deno.test("planPerLineEscrowAction rejects passing both exchange_id and exchange_ids", () => {
+  const plan = planPerLineEscrowAction("redeem", { exchange_id: "e1", exchange_ids: ["e2"] });
+  assertEquals(plan.ok, false);
+  if (!plan.ok) assertStringIncludes(plan.error, "mutually exclusive");
+});
+
+Deno.test("planPerLineEscrowAction rejects an empty exchange_ids set", () => {
+  // Non-empty input that normalizes to empty, and the already-empty array.
+  const a = planPerLineEscrowAction("redeem", { exchange_ids: ["  ", ""] });
+  assertEquals(a.ok, false);
+  if (!a.ok) assertStringIncludes(a.error, "empty");
+  const b = planPerLineEscrowAction("dispute", { exchange_ids: [] });
+  assertEquals(b.ok, false);
+});
+
+Deno.test("planPerLineEscrowAction rejects a per-line cancel that also asks to withdraw", () => {
+  const plan = planPerLineEscrowAction("cancel", { exchange_ids: ["e1", "e2"], withdraw: true });
+  assertEquals(plan.ok, false);
+  if (!plan.ok) assertStringIncludes(plan.error, "withdraw is single-line only");
+});
+
+Deno.test("planPerLineEscrowAction validates the dispute action and defaults it to raise", () => {
+  const bad = planPerLineEscrowAction("dispute", { exchange_ids: ["e1"], action: "bogus" });
+  assertEquals(bad.ok, false);
+  const def = planPerLineEscrowAction("dispute", { exchange_ids: ["e1"] });
+  assertEquals(def.ok, true);
+  if (def.ok) {
+    assertEquals(def.action, "raise");
+    assertEquals(def.exchangeIds, ["e1"]);
+  }
+  const esc = planPerLineEscrowAction("dispute", {
+    exchange_ids: ["e1", "e2"],
+    action: "escalate",
+  });
+  assertEquals(esc.ok, true);
+  if (esc.ok) assertEquals(esc.action, "escalate");
+});
+
+Deno.test("the per-line action tools expose run and dispatch on exchange_ids", async () => {
+  for (const name of ["facet_redeem", "facet_cancel", "facet_dispute"]) {
+    const tool = TOOLS.find((t) => t.name === name);
+    assert(tool !== undefined, `${name} is not registered`);
+    assert(tool.run !== undefined, `${name} must expose an in-process run`);
+    // No exchange_ids: run returns null so executeTool falls through to the spawn
+    // (single-exchange) path. This must NOT touch the wallet or the network.
+    const passthrough = await tool.run!({ terminal: "https://x.facet.llc" });
+    assertEquals(passthrough, null, `${name} must fall through to the CLI without a set`);
+    // A per-line set that fails validation (here: both single and set given) is
+    // answered in-process as a structured error, again before any wallet or network.
+    const both = await tool.run!({
+      terminal: "https://x.facet.llc",
+      exchange_id: "e1",
+      exchange_ids: ["e2"],
+    });
+    assert(both !== null, `${name} must answer a per-line set in-process`);
+    assertEquals(both.isError, true);
+    const payload = JSON.parse(both.content[0].text) as { ok: boolean; error: string };
+    assertEquals(payload.ok, false);
+    assertStringIncludes(payload.error, "mutually exclusive");
+    // The single-exchange CLI path is still wired for these tools.
+    assert(tool.build !== undefined, `${name} must keep its single-exchange build`);
+  }
+});
+
+Deno.test("facet_lines is a run-only reader with no spawn wiring", () => {
+  const tool = TOOLS.find((t) => t.name === "facet_lines");
+  assert(tool !== undefined, "facet_lines is not registered");
+  assert(tool.run !== undefined, "facet_lines must expose an in-process run");
+  // Run-only: there is no CLI subcommand behind it.
+  assertEquals(tool.script, undefined);
+  assertEquals(tool.build, undefined);
+  assertEquals(tool.perms, undefined);
+});
+
+Deno.test("a per-line cancel with withdraw is refused in-process", async () => {
+  const tool = TOOLS.find((t) => t.name === "facet_cancel");
+  assert(tool !== undefined, "facet_cancel is not registered");
+  const r = await tool.run!({
+    terminal: "https://x.facet.llc",
+    exchange_ids: ["e1", "e2"],
+    withdraw: true,
+  });
+  assert(r !== null, "a per-line set must be handled in-process");
+  assertEquals(r.isError, true);
+  const payload = JSON.parse(r.content[0].text) as { ok: boolean; error: string };
+  assertEquals(payload.ok, false);
+  assertStringIncludes(payload.error, "withdraw is single-line only");
 });

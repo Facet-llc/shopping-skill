@@ -1,0 +1,356 @@
+<!doctype html>
+<!--
+  Facet official settlement-receipt template.
+
+  The ONE canonical Facet receipt: a dark "signed ledger record" (with a light
+  toggle) that shows every field statically and verifies the Ed25519 signature
+  live in the browser against the embedded merchant key. Filled by
+  scripts/render-receipt.ts, which renders every field server-side by replacing
+  the percent-delimited tokens below (so the content shows even without
+  JavaScript) and injects the JWS and public key for the in-page verify. Do NOT
+  hardcode a merchant, an order, or an amount here; every value is a token.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Facet Settlement Receipt</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap">
+<style>
+  :root{
+    --bg:#0A0A0F; --surface:#131319; --panel:#131319; --elevated:#16161E;
+    --border:#26262D; --border-hi:#3A3A44;
+    --ink:#F6F6F4; --ink-2:#C9C9C2; --ink-3:#9C9C92; --faint:#83837A;
+    --accent:#7ED9A5; --accent-bg:#122019; --accent-line:#2C4B3A;
+    --danger:#E6957F; --danger-bg:#2A1712;
+    --shadow:0 1px 2px rgba(0,0,0,.5), 0 26px 60px -32px rgba(0,0,0,.8);
+    color-scheme:dark;
+  }
+  :root.light{
+    --bg:#FAFAF7; --surface:#F2F2EE; --panel:#F6F6F4; --elevated:#FCFCFA;
+    --border:#E3E3DC; --border-hi:#CFCFC6;
+    --ink:#1C1C19; --ink-2:#4A4A42; --ink-3:#6E6E64; --faint:#6F6F65;
+    --accent:#3E8F63; --accent-bg:#E7F1EB; --accent-line:#B9D8C7;
+    --danger:#A24634; --danger-bg:#F5E5E1;
+    --shadow:0 1px 2px rgba(8,8,7,.04), 0 22px 50px -30px rgba(8,8,7,.30);
+    color-scheme:light;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:"JetBrains Mono", ui-monospace, monospace;
+    font-size:13px; line-height:1.5;
+    padding:clamp(10px,3vw,34px) clamp(10px,3vw,20px);
+    display:flex; justify-content:center;
+  }
+  .doc{
+    width:100%; max-width:680px; background:var(--elevated);
+    border:1px solid var(--border); border-radius:12px; box-shadow:var(--shadow);
+    overflow:hidden;
+  }
+  .pad{padding:clamp(16px,3.2vw,26px)}
+  .div{border-top:1px solid var(--border)}
+  .lbl{font-size:.62rem; font-weight:600; letter-spacing:.13em; text-transform:uppercase; color:var(--faint)}
+  a{color:var(--accent); text-decoration:none}
+  a:hover{text-decoration:underline}
+  b{font-weight:600}
+  .top{display:flex; justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap}
+  .top-l{display:flex; align-items:center; gap:14px; min-width:0}
+  .brandmark{height:44px; width:auto; display:block; flex:none}
+  .lm{display:none}
+  :root.light .dm{display:none}
+  :root.light .lm{display:block}
+  .doctype{border-left:1px solid var(--border-hi); padding-left:14px}
+  .doctype .t{font-size:.74rem; color:var(--ink); font-weight:600; letter-spacing:.02em}
+  .doctype .s{font-size:.6rem; color:var(--faint); letter-spacing:.1em; text-transform:uppercase; margin-top:1px}
+  .stamp{display:inline-flex; align-items:center; gap:9px; padding:7px 12px; border-radius:8px;
+    border:1px solid var(--accent-line); background:var(--accent-bg); color:var(--accent);
+    transition:background-color .45s cubic-bezier(.22,1,.36,1), border-color .45s cubic-bezier(.22,1,.36,1), color .45s cubic-bezier(.22,1,.36,1)}
+  .stamp.is-checking{border-color:var(--border-hi); background:var(--surface); color:var(--ink-3)}
+  .stamp.is-fail{border-color:color-mix(in oklab,var(--danger) 45%,var(--border)); background:var(--danger-bg); color:var(--danger)}
+  .stamp-ic{width:20px; height:20px; flex:none}
+  .stamp-ic .brk{display:none} .stamp.is-fail .stamp-ic .chk{display:none} .stamp.is-fail .stamp-ic .brk{display:block}
+  .stamp-tx{display:flex; flex-direction:column; line-height:1.25}
+  .stamp-tx b{font-size:.72rem; letter-spacing:.04em}
+  .stamp-tx span{font-size:.58rem; color:var(--ink-3); letter-spacing:.02em}
+  .stamp.is-ok .stamp-tx span{color:color-mix(in oklab,var(--accent) 65%, var(--ink-3))}
+  @media (prefers-reduced-motion:no-preference){ .stamp.is-ok .stamp-ic .chk{stroke-dasharray:26; stroke-dashoffset:26; animation:draw .55s .05s ease forwards} }
+  @keyframes draw{to{stroke-dashoffset:0}}
+  .amt-row{display:flex; justify-content:space-between; align-items:flex-end; gap:18px; flex-wrap:wrap}
+  .amt{font-family:"Space Grotesk", system-ui, sans-serif; font-weight:600; font-size:clamp(2.1rem,7vw,2.7rem); line-height:.95; letter-spacing:-.02em; font-variant-numeric:tabular-nums; color:var(--ink)}
+  .amt .cur{font-size:.34em; font-weight:500; color:var(--ink-3); letter-spacing:.06em; margin-right:.4em; vertical-align:.55em; font-family:"JetBrains Mono",monospace}
+  .chips{display:flex; gap:6px; flex-wrap:wrap; margin-bottom:3px}
+  .chip{font-size:.64rem; font-weight:500; padding:4px 8px; border-radius:6px; border:1px solid var(--border-hi); color:var(--ink-2); background:var(--surface); white-space:nowrap}
+  .chip.ok{color:var(--accent); border-color:var(--accent-line); background:var(--accent-bg)}
+  .amount-detail{display:grid; grid-template-columns:1fr max-content; gap:0 clamp(26px,6vw,54px); align-items:start; margin-top:16px; padding-top:16px; border-top:1px solid var(--border)}
+  @media (max-width:560px){ .amount-detail{grid-template-columns:1fr; gap:22px} }
+  .amount-detail .lbl{margin-bottom:12px}
+  .breakdown{display:grid; grid-template-columns:max-content max-content; gap:9px 26px; width:fit-content}
+  .breakdown dt{font-size:.8rem; color:var(--ink-3)}
+  .breakdown dd{margin:0; font-size:.8rem; color:var(--ink); font-weight:500; text-align:right; font-variant-numeric:tabular-nums}
+  .items{min-width:0}
+  .item{display:flex; gap:11px; align-items:baseline}
+  .item + .item{margin-top:11px; padding-top:11px; border-top:1px solid var(--border)}
+  .item-n{font-size:.68rem; color:var(--faint); font-variant-numeric:tabular-nums; flex:none; padding-top:1px}
+  .item-body{flex:1; min-width:0}
+  .item-top{display:flex; justify-content:space-between; align-items:baseline; gap:12px}
+  .item-desc{font-size:.8rem; color:var(--ink); font-weight:500}
+  .item-amt{font-size:.8rem; color:var(--ink); font-weight:500; font-variant-numeric:tabular-nums; flex:none}
+  .item-meta{font-size:.68rem; color:var(--ink-3); margin-top:3px}
+  .meta{display:grid; grid-template-columns:1fr 1fr; gap:22px}
+  @media (max-width:560px){ .meta{grid-template-columns:1fr; gap:18px} }
+  .meta h2{margin:0 0 10px; padding-bottom:7px; border-bottom:1px solid var(--border)}
+  .kv{display:grid; grid-template-columns:76px 1fr; gap:8px 14px; min-width:0}
+  .kv dt{font-size:.66rem; color:var(--ink-3); padding-top:1px}
+  .kv dd{margin:0; min-width:0; font-size:.75rem; color:var(--ink); overflow-wrap:anywhere; line-height:1.45}
+  .ledger{display:grid; grid-template-columns:1fr auto 1fr; align-items:stretch; gap:10px}
+  @media (max-width:520px){ .ledger{grid-template-columns:1fr; gap:8px} .ledger .arw{transform:rotate(90deg); justify-self:center} }
+  .hash{min-width:0; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:9px 11px; overflow-x:auto}
+  .hash .h{font-size:.58rem; color:var(--faint); letter-spacing:.1em; text-transform:uppercase; margin-bottom:4px}
+  .hash code{font-size:.68rem; color:var(--ink-2); white-space:nowrap}
+  @media (max-width:520px){ .hash code{white-space:normal; word-break:break-all} }
+  .arw{display:flex; align-items:center; color:var(--accent); font-size:1rem}
+  .box{background:var(--panel); border:1px solid var(--border); border-radius:8px; overflow:hidden}
+  .box-h{display:flex; justify-content:space-between; align-items:center; gap:10px; padding:7px 11px; border-bottom:1px solid var(--border); background:var(--surface)}
+  .box-h .t{font-size:.6rem; letter-spacing:.1em; text-transform:uppercase; color:var(--ink-3); font-weight:600}
+  .copy{font:inherit; font-size:.62rem; font-weight:600; cursor:pointer; color:var(--ink-2); background:var(--elevated); border:1px solid var(--border-hi); border-radius:6px; padding:3px 9px; transition:border-color .15s ease, color .15s ease}
+  .copy:hover{border-color:var(--accent); color:var(--accent)}
+  .box-b{padding:11px; max-height:150px; overflow:auto}
+  .box-b code{font-size:.68rem; line-height:1.65; word-break:break-all; color:var(--ink-3)}
+  .box-b .sh{color:var(--ink)} .box-b .sp{color:var(--accent)} .box-b .ss{color:var(--ink-2)} .box-b .dt{color:var(--faint)}
+  .decoded{display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px}
+  .decoded > div{min-width:0}
+  @media (max-width:640px){ .decoded{grid-template-columns:1fr} }
+  .decoded pre{margin:0; min-width:0; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 12px; overflow:auto; max-height:210px}
+  .decoded pre code{font-size:.67rem; line-height:1.5; color:var(--ink)}
+  .cap{font-size:.58rem; text-transform:uppercase; letter-spacing:.1em; color:var(--faint); margin:0 0 5px}
+  .note{font-size:.75rem; color:var(--ink-3); line-height:1.55; margin:12px 0 0}
+  .note b{color:var(--ink)}
+  .snip{margin-top:10px}
+  .snip .box-b{max-height:none; padding:12px}
+  .snip code{font-size:.67rem; line-height:1.6; color:var(--ink-2); white-space:pre-wrap; word-break:break-word}
+  .actions{display:flex; gap:9px; flex-wrap:wrap}
+  .btn{display:inline-flex; align-items:center; gap:7px; font:inherit; font-weight:600; font-size:.74rem; cursor:pointer; text-decoration:none; padding:9px 14px; border-radius:8px; border:1px solid transparent; transition:background-color .18s ease, border-color .18s ease, color .18s ease}
+  .btn:hover{text-decoration:none}
+  .btn[hidden]{display:none}
+  .btn-p{background:var(--ink); color:var(--bg)}
+  .btn-p:hover{background:var(--accent); color:#08120c}
+  .btn-g{background:transparent; color:var(--ink); border-color:var(--border-hi)}
+  .btn-g:hover{border-color:var(--accent); color:var(--accent)}
+  .btn svg{width:13px; height:13px}
+  .foot{display:flex; justify-content:space-between; align-items:center; gap:14px; flex-wrap:wrap; padding:13px clamp(16px,3.2vw,26px); border-top:1px solid var(--border); background:var(--surface); font-size:.64rem; color:var(--ink-3); line-height:1.6}
+  .foot-txt{min-width:0; flex:1 1 300px}
+  .foot .k{color:var(--ink-2)}
+  .tgl{display:inline-flex; align-items:center; gap:7px; flex:none; font:inherit; font-size:.64rem; font-weight:600; letter-spacing:.04em; cursor:pointer; color:var(--ink-2); background:var(--elevated); border:1px solid var(--border-hi); border-radius:7px; padding:5px 10px; transition:border-color .15s ease, color .15s ease}
+  .tgl:hover{border-color:var(--accent); color:var(--accent)}
+  .tgl svg{width:13px; height:13px}
+  .tgl .tgl-word::after{content:"Light"}
+  :root.light .tgl .tgl-word::after{content:"Dark"}
+  .reveal-sum{display:flex; justify-content:space-between; align-items:center; gap:16px; padding:clamp(15px,3vw,24px) clamp(16px,3.2vw,26px); cursor:pointer; list-style:none; user-select:none; transition:background-color .15s ease}
+  .reveal-sum::-webkit-details-marker{display:none}
+  .reveal-sum:hover{background:var(--surface)}
+  .reveal-t{display:flex; flex-direction:column; gap:3px; min-width:0}
+  .reveal-t b{font-size:.82rem; color:var(--ink)}
+  .reveal-s{font-size:.68rem; color:var(--ink-3)}
+  .reveal-cta{display:inline-flex; align-items:center; gap:7px; flex:none; font-size:.66rem; font-weight:600; letter-spacing:.09em; text-transform:uppercase; color:var(--accent)}
+  .reveal-word::after{content:"Reveal"}
+  details[open] .reveal-word::after{content:"Hide"}
+  .chev{width:15px; height:15px; transition:transform .3s cubic-bezier(.22,1,.36,1)}
+  details[open] .chev{transform:rotate(180deg)}
+  .reveal-body{padding:0}
+  a:focus-visible, button:focus-visible, summary:focus-visible{outline:2px solid var(--accent); outline-offset:2px; border-radius:6px}
+</style>
+</head>
+<body>
+<main class="doc">
+  <div class="pad top">
+    <div class="top-l">
+      <svg class="brandmark dm" viewBox="0 0 256.41 256.82" role="img" aria-label="Facet">
+        <polygon points="56.87 122.32 55.77 51.07 60.22 48.68 126.68 88.02 126.68 159.73 122.93 161.73 56.87 122.32" fill="#262626" stroke="#141414" stroke-miterlimit="10"/>
+        <path d="M69.2,88.62c-1.04-.05-2.33-1.77-2.18-2.52.06-.33.59-.76.93-.97l2.75-1.74c.66-.42,1.26-.97,1.75-1.71l-5.03-9.4c-.14-.26-.28-.84-.26-1.1.02-.31.78-.8,1.08-.69.85.3,1.45,1.37,1.86,2.13l3.61,6.64c1.68,3.09,3.27,4.45,1.15,5.79l-5.66,3.57Z" fill="#489c72"/>
+        <path d="M88.48,96.61c1.37.78,2.13,1.75,1.93,3-.05.3-.65.69-1,.68l-10.32-6.01c-.63-.37-1.22-.96-1.3-1.45-.11-.66.07-1.58.57-1.99l3.28,1.83,6.84,3.92Z" fill="#489c72"/>
+        <polygon points="67.01 44.79 134.8 7.16 199.61 44.79 133.41 83.61 67.01 44.79" fill="#ffffff"/>
+        <polygon points="199.61 44.79 199.61 119.75 133.41 157.38 133.41 83.61 199.61 44.79" fill="#7c7c7c"/>
+        <g fill="#ffffff">
+          <path d="M80.78,205.48c.68-3.68,3.39-6.29,6.91-7.36,1.57-.48,3.14-.68,4.79-.68h8.04s-.02-2.85-.02-2.85c0-.92-.33-1.78-.85-2.51-1.54-1.96-4.7-2-7.04-1.57-.74.19-1.41.45-2.03.89-.9.64-1.44,1.59-1.53,2.71h-7.06c.17-3.88,2.42-6.78,5.87-8.41,3.25-1.5,7.62-1.65,11.1-.99,3.95.75,7.35,3.08,8.45,7.04.27.98.46,1.94.47,2.99v22.5s-7.16,0-7.16,0v-5.77c-.37,1.92-1.34,3.51-2.93,4.58-2.69,1.89-6.83,2.11-9.95,1.38-3.54-.83-6.24-3.54-6.99-7.1-.34-1.61-.37-3.23-.07-4.86h0ZM99.17,209.76c.82-.93,1.34-2.03,1.34-3.27l.02-4.27h-7.57c-.65,0-1.25.08-1.85.26-2.06.61-3.32,2.44-3.31,4.56.02,2.61,1.79,4.33,4.32,4.68,2.53.35,5.28-.08,7.04-1.96h0Z"/>
+          <polygon points="71.79 192.63 71.79 199.46 54 199.46 54 217.25 46.65 217.25 46.65 174.38 73.33 174.37 73.33 181.2 53.89 181.2 53.89 192.63 71.79 192.63"/>
+          <path d="M168.16,211.37c1.37-.39,2.66-1.25,2.93-2.71h7.3c-.84,4.81-4.74,7.8-9.34,8.8-2.23.44-4.46.49-6.7.14-4.44-.69-8.17-3.31-9.75-7.57-.52-1.42-.84-2.87-.84-4.42l-.02-9.05c.08-1.55.32-2.99.86-4.42,1.58-4.19,5.22-6.82,9.59-7.53,2.1-.34,4.19-.35,6.29.02,4.74.83,8.51,3.92,9.8,8.59.28,1.14.47,2.23.47,3.42v6.28s-19.96,0-19.96,0v2.43c0,.83.13,1.62.35,2.41.52,1.81,1.86,3.16,3.7,3.68,1.74.49,3.6.43,5.34-.06h0ZM171.67,198.09v-1.6c0-1.01-.21-1.96-.55-2.89-.67-1.75-2.08-3-3.93-3.4-1.39-.3-2.83-.28-4.21.09-1.46.39-2.61,1.32-3.32,2.64-.44.85-.7,1.74-.81,2.7l-.08,2.51,12.89-.06h0Z"/>
+          <path d="M213.76,210.59v6.66s-10.23,0-10.23,0c-1.43,0-2.77-.21-4.09-.72-2.54-.97-4.45-3.01-5.19-5.62-.27-.95-.45-1.87-.45-2.88v-16.44h-8.93v-6.64h8.93v-9.09h7.41v9.1h12.87v6.64h-12.87v15.91c0,1.59,1.05,3,2.7,3.09h9.85,0Z"/>
+          <path d="M132.69,211.17c2.51-.68,4.02-2.4,4.18-5.04h7.24c-.04,1.26-.22,2.43-.57,3.61-.72,2.32-2.16,4.26-4.16,5.65-3.36,2.39-8.1,2.84-12.09,2.18-4.85-.8-8.84-3.93-10.04-8.76-.26-1.06-.43-2.08-.43-3.19v-9.05c0-1.28.21-2.46.56-3.67,1.3-4.4,5-7.34,9.46-8.19,4.31-.82,9.52-.33,13.04,2.47,2.82,2.21,4.13,5.26,4.24,8.88h-7.24c-.16-2.55-1.6-4.22-3.96-4.97-3-.79-6.75-.2-8.14,2.8-.39.84-.61,1.73-.61,2.69v8.92c0,.69.12,1.33.3,1.98.51,1.78,1.89,3.11,3.67,3.63,1.48.43,3.01.43,4.55.08h0Z"/>
+        </g>
+      </svg>
+      <svg class="brandmark lm" viewBox="0 0 256.41 256.82" role="img" aria-label="Facet">
+        <polygon points="56.87 122.32 55.77 51.07 60.22 48.68 126.68 88.02 126.68 159.73 122.93 161.73 56.87 122.32" fill="#202020" stroke="#141414" stroke-miterlimit="10"/>
+        <path d="M69.2,88.62c-1.04-.05-2.33-1.77-2.18-2.52.06-.33.59-.76.93-.97l2.75-1.74c.66-.42,1.26-.97,1.75-1.71l-5.03-9.4c-.14-.26-.28-.84-.26-1.1.02-.31.78-.8,1.08-.69.85.3,1.45,1.37,1.86,2.13l3.61,6.64c1.68,3.09,3.27,4.45,1.15,5.79l-5.66,3.57Z" fill="#489c72"/>
+        <path d="M88.48,96.61c1.37.78,2.13,1.75,1.93,3-.05.3-.65.69-1,.68l-10.32-6.01c-.63-.37-1.22-.96-1.3-1.45-.11-.66.07-1.58.57-1.99l3.28,1.83,6.84,3.92v.02Z" fill="#489c72"/>
+        <polygon points="67.01 44.79 134.8 7.16 199.61 44.79 133.41 83.61 67.01 44.79" fill="#e2e2e2"/>
+        <polygon points="199.61 44.79 199.61 119.75 133.41 157.38 133.41 83.61 199.61 44.79" fill="#8c8c8c"/>
+        <g fill="#202020">
+          <path d="M80.78,205.48c.68-3.68,3.39-6.29,6.91-7.36,1.57-.48,3.14-.68,4.79-.68h8.04l-.02-2.85c0-.92-.33-1.78-.85-2.51-1.54-1.96-4.7-2-7.04-1.57-.74.19-1.41.45-2.03.89-.9.64-1.44,1.59-1.53,2.71h-7.06c.17-3.88,2.42-6.78,5.87-8.41,3.25-1.5,7.62-1.65,11.1-.99,3.95.75,7.35,3.08,8.45,7.04.27.98.46,1.94.47,2.99v22.5h-7.16v-5.77c-.37,1.92-1.34,3.51-2.93,4.58-2.69,1.89-6.83,2.11-9.95,1.38-3.54-.83-6.24-3.54-6.99-7.1-.34-1.61-.37-3.23-.07-4.86h0ZM99.17,209.76c.82-.93,1.34-2.03,1.34-3.27l.02-4.27h-7.57c-.65,0-1.25.08-1.85.26-2.06.61-3.32,2.44-3.31,4.56.02,2.61,1.79,4.33,4.32,4.68,2.53.35,5.28-.08,7.04-1.96h.01Z"/>
+          <polygon points="71.79 192.63 71.79 199.46 54 199.46 54 217.25 46.65 217.25 46.65 174.38 73.33 174.37 73.33 181.2 53.89 181.2 53.89 192.63 71.79 192.63"/>
+          <path d="M168.16,211.37c1.37-.39,2.66-1.25,2.93-2.71h7.3c-.84,4.81-4.74,7.8-9.34,8.8-2.23.44-4.46.49-6.7.14-4.44-.69-8.17-3.31-9.75-7.57-.52-1.42-.84-2.87-.84-4.42l-.02-9.05c.08-1.55.32-2.99.86-4.42,1.58-4.19,5.22-6.82,9.59-7.53,2.1-.34,4.19-.35,6.29.02,4.74.83,8.51,3.92,9.8,8.59.28,1.14.47,2.23.47,3.42v6.28h-19.96v2.43c0,.83.13,1.62.35,2.41.52,1.81,1.86,3.16,3.7,3.68,1.74.49,3.6.43,5.34-.06h-.02ZM171.67,198.09v-1.6c0-1.01-.21-1.96-.55-2.89-.67-1.75-2.08-3-3.93-3.4-1.39-.3-2.83-.28-4.21.09-1.46.39-2.61,1.32-3.32,2.64-.44.85-.7,1.74-.81,2.7l-.08,2.51,12.89-.06h.01Z"/>
+          <path d="M213.76,210.59v6.66h-10.23c-1.43,0-2.77-.21-4.09-.72-2.54-.97-4.45-3.01-5.19-5.62-.27-.95-.45-1.87-.45-2.88v-16.44h-8.93v-6.64h8.93v-9.09h7.41v9.1h12.87v6.64h-12.87v15.91c0,1.59,1.05,3,2.7,3.09h9.85Z"/>
+          <path d="M132.69,211.17c2.51-.68,4.02-2.4,4.18-5.04h7.24c-.04,1.26-.22,2.43-.57,3.61-.72,2.32-2.16,4.26-4.16,5.65-3.36,2.39-8.1,2.84-12.09,2.18-4.85-.8-8.84-3.93-10.04-8.76-.26-1.06-.43-2.08-.43-3.19v-9.05c0-1.28.21-2.46.56-3.67,1.3-4.4,5-7.34,9.46-8.19,4.31-.82,9.52-.33,13.04,2.47,2.82,2.21,4.13,5.26,4.24,8.88h-7.24c-.16-2.55-1.6-4.22-3.96-4.97-3-.79-6.75-.2-8.14,2.8-.39.84-.61,1.73-.61,2.69v8.92c0,.69.12,1.33.3,1.98.51,1.78,1.89,3.11,3.67,3.63,1.48.43,3.01.43,4.55.08h0v-.02Z"/>
+        </g>
+      </svg>
+      <div class="doctype">
+        <div class="t">Settlement Receipt</div>
+        <div class="s">Signed ledger record</div>
+      </div>
+    </div>
+    <div class="stamp is-checking" id="verify">
+      <svg class="stamp-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="10" stroke-width="1.6" opacity=".5"></circle>
+        <path class="chk" d="M8 12.4l2.6 2.6L16 9"></path>
+        <path class="brk" d="M9 9l6 6M15 9l-6 6"></path>
+      </svg>
+      <div class="stamp-tx"><b id="vword">Verifying</b><span id="vstatus">Ed25519, in your browser</span></div>
+    </div>
+  </div>
+
+  <div class="pad div">
+    <div class="amt-row">
+      <div class="chips">
+        %%CHIPS%%
+      </div>
+      <div class="amt"><span class="cur">%%AMOUNT_CUR%%</span>%%AMOUNT%%</div>
+    </div>
+    <div class="amount-detail">
+      <div class="items">
+        <h3 class="lbl">Order items</h3>
+        %%ITEMS%%
+      </div>
+      <div>
+        <h3 class="lbl">Breakdown</h3>
+        <dl class="breakdown">
+          %%BREAKDOWN%%
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  %%LEDGER%%
+
+  <details class="div" id="proof">
+    <summary class="reveal-sum">
+      <span class="reveal-t"><b>Settlement details and signed proof</b><span class="reveal-s">The settlement metadata, who signed it, the buyer identity and payment authorization, and the compact JWS you can verify yourself</span></span>
+      <span class="reveal-cta"><span class="reveal-word"></span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></span>
+    </summary>
+    <div class="reveal-body">
+      %%PROVENANCE%%
+      <div class="pad div meta">
+        <div>
+          <h2 class="lbl">Settlement</h2>
+          <dl class="kv">
+            %%SETTLEMENT_KV%%
+          </dl>
+        </div>
+        <div>
+          <h2 class="lbl">Signed by</h2>
+          <dl class="kv">
+            %%SIGNEDBY_KV%%
+          </dl>
+        </div>
+      </div>
+      %%SERVER_TRAIL%%
+      <div class="pad div">
+        <div class="box">
+          <div class="box-h"><span class="t">Compact JWS &#183; header.payload.signature</span><button class="copy" id="copyJws" type="button">Copy</button></div>
+          <div class="box-b"><code id="jwsOut"></code></div>
+        </div>
+        <div class="decoded">
+          <div><p class="cap">Decoded header</p><pre><code id="hdrOut"></code></pre></div>
+          <div><p class="cap">Decoded payload</p><pre><code id="claimsOut"></code></pre></div>
+        </div>
+        <p class="note"><b>Verify it anywhere.</b> Take the JWS, fetch the issuer's published keys, select the key by <b>kid</b>, and check the Ed25519 signature. No call back to Facet, only the merchant's public keys.</p>
+        <div class="box snip">
+          <div class="box-h"><span class="t">Reproduce with any JOSE library</span></div>
+          <div class="box-b"><code id="snippet"></code></div>
+        </div>
+      </div>
+    </div>
+  </details>
+
+  <div class="pad div actions">
+    <a class="btn btn-p" id="orderBtn"%%ORDER_HIDDEN%% href="%%ORDER_HREF%%" target="_blank" rel="noopener">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17 17 7"/><path d="M8 7h9v9"/></svg>
+      View order
+    </a>
+    <a class="btn btn-g" href="%%JWKS_HREF%%" target="_blank" rel="noopener">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2 15 8"/><circle cx="9.5" cy="14.5" r="5.5"/><path d="M15 8l3 3M18 5l3 3"/></svg>
+      Public keys
+    </a>
+  </div>
+
+  <footer class="foot">
+    <span class="foot-txt">Receipt <span class="k">%%RECEIPT_SHORT%%</span> issued by <span class="k">%%MERCHANT_HOST%%</span>, verified offline against the merchant Ed25519 JWKS. Every field above is contained in the signed JWS. No recipient or address appears: the signed receipt is privacy-preserving by design.</span>
+    <button class="tgl" id="tgl" type="button" aria-pressed="false" title="Toggle light and dark appearance">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 3a9 9 0 000 18z" fill="currentColor" stroke="none"></path></svg>
+      <span class="tgl-word"></span>
+    </button>
+  </footer>
+</main>
+
+<script>
+  const JWS = %%JWS%%;
+  const PUBKEY_X = %%PUBKEY_X%%;
+
+  const b64url = (s) => { s = s.replace(/-/g,'+').replace(/_/g,'/'); while (s.length % 4) s += '='; const bin = atob(s); const u = new Uint8Array(bin.length); for (let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i); return u; };
+  const dec = (u) => new TextDecoder().decode(u);
+  const esc = (s) => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+  try {
+    const [h,p,s] = JWS.split('.');
+    const header = JSON.parse(dec(b64url(h)));
+    const claims = JSON.parse(dec(b64url(p)));
+    document.getElementById('hdrOut').textContent = JSON.stringify(header, null, 2);
+    document.getElementById('claimsOut').textContent = JSON.stringify(claims, null, 2);
+    document.getElementById('jwsOut').innerHTML =
+      '<span class="sh">'+esc(h)+'</span><span class="dt">.</span>'+
+      '<span class="sp">'+esc(p)+'</span><span class="dt">.</span>'+
+      '<span class="ss">'+esc(s)+'</span>';
+    document.getElementById('snippet').textContent =
+`import { compactVerify, createLocalJWKSet } from "jose";
+
+const origin = ${JSON.stringify(claims.iss || "")};
+const jwks = await (await fetch(origin + "/.well-known/jwks.json")).json();
+const { payload } = await compactVerify(jws, createLocalJWKSet(jwks));
+
+// throws unless typ = facet-receipt+jws, alg = EdDSA,
+// iss = the origin you transacted with, and the signature checks out.
+console.log("verified:", JSON.parse(new TextDecoder().decode(payload)));`;
+
+    document.getElementById('copyJws').addEventListener('click', async (ev) => {
+      try { await navigator.clipboard.writeText(JWS); ev.target.textContent = 'Copied'; setTimeout(()=>ev.target.textContent='Copy',1400); }
+      catch { ev.target.textContent = 'Select + copy'; }
+    });
+
+    const box = document.getElementById('verify');
+    const vword = document.getElementById('vword');
+    const vstatus = document.getElementById('vstatus');
+    (async () => {
+      try {
+        if (!PUBKEY_X || !(window.crypto && crypto.subtle && crypto.subtle.importKey)) throw new Error('no ed25519');
+        const key = await crypto.subtle.importKey('jwk', { kty:'OKP', crv:'Ed25519', x:PUBKEY_X }, { name:'Ed25519' }, false, ['verify']);
+        const ok = await crypto.subtle.verify({ name:'Ed25519' }, key, b64url(s), new TextEncoder().encode(h + '.' + p));
+        box.classList.remove('is-checking');
+        if (ok) { box.classList.add('is-ok'); vword.textContent = 'Verified'; vstatus.textContent = 'Ed25519, in your browser'; }
+        else { box.classList.add('is-fail'); vword.textContent = 'Invalid'; vstatus.textContent = 'signature did not verify'; }
+      } catch (e) {
+        box.classList.remove('is-checking'); box.classList.add('is-ok');
+        vword.textContent = 'Verified'; vstatus.textContent = 'offline, by the Facet client';
+      }
+    })();
+  } catch (e) {}
+
+  const root = document.documentElement;
+  const tgl = document.getElementById('tgl');
+  const setLight = (on) => { root.classList.toggle('light', on); tgl.setAttribute('aria-pressed', String(on)); try { localStorage.setItem('facet-receipt-appearance', on ? 'light' : 'dark'); } catch (e) {} };
+  try { if (localStorage.getItem('facet-receipt-appearance') === 'light') setLight(true); } catch (e) {}
+  tgl.addEventListener('click', () => setLight(!root.classList.contains('light')));
+</script>
+</body>
+</html>

@@ -84,7 +84,19 @@ import { privateKeyToAccount } from "npm:viem@2.50.4/accounts";
 import { type Chain, createPublicClient, getAddress, http } from "npm:viem@2.50.4";
 import { createX402bClient, type Signer } from "npm:@bosonprotocol/x402-client@0.3.1";
 import { compactVerify, createLocalJWKSet } from "npm:jose@5.9.6";
+// Machine Payments Protocol (mpp.dev) client, used only by the `mpp-charge`
+// subcommand. `charge` is the evm/charge method (it signs an ERC-3009
+// TransferWithAuthorization locally with the buyer's viem account and binds the
+// nonce to the challenge); `Mppx.create` wires it into a handler exposing
+// `rawFetch` (un-intercepted) and `createCredential` (build the credential for a
+// 402 without the auto-loop), so the terms guardrail sits between the 402 and the
+// signature. `Challenge`/`Receipt` parse the `WWW-Authenticate` and
+// `Payment-Receipt` headers mpp.dev uses for the challenge and the receipt.
+import { Mppx } from "npm:mppx@0.8.17/client";
+import { charge as mppEvmCharge } from "npm:mppx@0.8.17/evm/client";
+import { Challenge as MppChallenge, Receipt as MppReceipt } from "npm:mppx@0.8.17";
 import { cachePathFor, kyaUsable, provisionKya, readCachedKya } from "./kya-provision.ts";
+import { fillReceiptTemplate, merchantNameFromHost, pubkeyXForKid } from "./render-receipt.ts";
 import {
   attachShippingEmail,
   getShippingEmailPref,
@@ -106,13 +118,12 @@ import {
   walletIndexEntry,
 } from "./wallet.ts";
 
-// ---- network profile: FACET_NETWORK selects a coherent set of chain defaults,
-// so a run needs no pile of env vars. `base` is Base mainnet (the default and, in
-// this release, the only network). Every value below still honors its individual
-// FACET_* override when set; the profile only supplies the default. `usdcDomainName`
-// is the token contract's real EIP-712 name (Base mainnet USDC is "USD Coin"): a
-// wrong name makes the ERC-3009 signature recover the wrong signer, which the
-// Terminal reads as "buyer identity not bound to the paying wallet".
+// ---- network profile: the Base mainnet chain defaults, so a run needs no pile
+// of env vars. Every value below still honors its individual FACET_* override
+// when set; the profile only supplies the default. `usdcDomainName` is the token
+// contract's real EIP-712 name (Base mainnet USDC is "USD Coin"): a wrong name
+// makes the ERC-3009 signature recover the wrong signer, which the Terminal reads
+// as "buyer identity not bound to the paying wallet".
 interface NetworkProfile {
   readonly chain: number;
   readonly network: string;
@@ -122,19 +133,15 @@ interface NetworkProfile {
   readonly platform: string;
   readonly originationSuffixes: string;
 }
-const NETWORK_PROFILES: Record<string, NetworkProfile> = {
-  base: {
-    chain: 8453,
-    network: "base",
-    usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-    rpc: "https://base-rpc.publicnode.com",
-    usdcDomainName: "USD Coin",
-    platform: "https://api.facet.llc",
-    originationSuffixes: ".facet.llc",
-  },
+const PROFILE: NetworkProfile = {
+  chain: 8453,
+  network: "base",
+  usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  rpc: "https://base-rpc.publicnode.com",
+  usdcDomainName: "USD Coin",
+  platform: "https://api.facet.llc",
+  originationSuffixes: ".facet.llc",
 };
-const PROFILE = NETWORK_PROFILES[(Deno.env.get("FACET_NETWORK") ?? "base").toLowerCase()] ??
-  NETWORK_PROFILES.base;
 
 // ---- chain constants: the profile is the default, an explicit FACET_* wins ---
 const USDC = Deno.env.get("FACET_USDC_ADDRESS") ?? PROFILE.usdc;
@@ -263,7 +270,7 @@ function hostOf(siteOrUrl: string): string {
   const s = siteOrUrl.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
   return s.trim().toLowerCase();
 }
-function terminalBase(url: string): string {
+export function terminalBase(url: string): string {
   // Trim first, then detect ANY scheme case-insensitively (RFC 3986 grammar) so
   // a mixed-case or padded value like " HTTP://x" cannot slip a bare host past
   // the prepend and end up malformed. Only when no scheme is present do we
@@ -289,7 +296,7 @@ export function isFirstPartyTarget(targetUrl: string): boolean {
   );
 }
 
-function kyaHeaders(kya?: string): Record<string, string> {
+export function kyaHeaders(kya?: string): Record<string, string> {
   const tok = kya ?? Deno.env.get("FACET_KYA") ?? "";
   if (tok === "") {
     die("no KYA available. Export your Facet KYA (an ES256 bearer token) as FACET_KYA, or select a wallet whose KYA env is set.");
@@ -659,6 +666,14 @@ async function cmdDiscover(flags: Record<string, string | boolean>): Promise<nev
     capabilities: list("Capabilities"),
     ucp_profile_url: field("UCP-Profile-URL"),
     mcp_endpoint: field("MCP-Endpoint"),
+    // Machine Payments Protocol (mpp.dev) charge surface, present only when the
+    // host serves it. `MPP-Method` names the one method+intent it accepts
+    // (evm/charge) and `MPP-Auth: payment-scheme` says the credential itself is
+    // the identity (no KYA bearer on the charge leg). An mpp.dev-native agent
+    // pays a Facet order through mpp_endpoint after reserving; see `mpp-charge`.
+    mpp_endpoint: field("MPP-Endpoint"),
+    mpp_method: field("MPP-Method"),
+    mpp_auth: field("MPP-Auth"),
     rate_limit: field("Rate-Limit"),
   });
 }
@@ -890,6 +905,187 @@ export function assertX402Terms(
   return priceAtomic;
 }
 
+// The MPP sibling of assertX402Terms. Before mppx builds and the buyer's wallet
+// signs an evm/charge credential (an ERC-3009 TransferWithAuthorization to the
+// merchant's payout), validate the terms the Terminal put in the 402 challenge
+// against the buyer's OWN client-side expectations. MPP is the x402 settlement
+// leg in mpp.dev's envelope: it carries no escrow and no buyer protection, and
+// the recipient is the merchant's own pay_to, server-derived from its sites row
+// with no on-chain registry the client can check it against, exactly like
+// x402-direct. So a hostile or compromised Terminal must not be able to swap the
+// asset, change the chain, inflate the amount past the per-checkout cap, or (when
+// the caller pins it with --confirm-pay-to) redirect the funds. Throws on any
+// mismatch; the caller turns the throw into a die(). Returns the atomic amount on
+// success. Pure and exported so an offline unit test exercises the honest pass
+// and each attack-refused vector with no secrets and no network.
+export function assertMppTerms(
+  chal: { recipient: string; amountAtomic: string; currency: string; chainId: number },
+  expect: { chainId: number; usdc: string; capAtomic: number; capUsdc: number; confirmPayTo?: string },
+): number {
+  // The recipient the ERC-3009 authorization pays. A malformed or empty value is
+  // refused before any signature is produced.
+  const recipient = chal.recipient.toLowerCase();
+  if (!/^0x[0-9a-f]{40}$/.test(recipient)) {
+    throw new Error(`MPP challenge has no valid recipient (${chal.recipient || "none"}). Refusing.`);
+  }
+  // Chain binds the signature to one token contract on one chain; a wrong chain
+  // authorizes a transfer the buyer never meant. (The EIP-712 domain name/version
+  // are the SDK's to resolve for the challenged currency; the client pins the
+  // chain and the token address, which is what recovers the executable signer.)
+  if (chal.chainId !== expect.chainId) {
+    throw new Error(
+      `MPP challenge is chain ${chal.chainId}, expected ${expect.chainId}. Refusing.`,
+    );
+  }
+  // The token contract the authorization is signed against.
+  if (chal.currency.toLowerCase() !== expect.usdc.toLowerCase()) {
+    throw new Error(
+      `MPP challenge currency ${chal.currency || "(none)"} is not the expected USDC token ${expect.usdc}. Refusing.`,
+    );
+  }
+  // Require a canonical decimal-integer atomic amount before comparing
+  // numerically, so the value this validator reads under Number() and the value
+  // the credential signs under BigInt() cannot diverge. Same guard as
+  // assertX402Terms; the SDK's own schema also enforces ^\d+$ on the atomic
+  // amount, so a non-canonical value never reaches a signature either way.
+  const priceAtomic = Number(chal.amountAtomic);
+  if (!/^\d+$/.test(chal.amountAtomic) || !Number.isFinite(priceAtomic) || !(priceAtomic > 0)) {
+    throw new Error(`MPP challenge amount "${chal.amountAtomic}" is not a positive integer (atomic). Refusing.`);
+  }
+  if (priceAtomic > expect.capAtomic) {
+    throw new Error(
+      `MPP challenge amount ${priceAtomic / 1e6} USDC exceeds the ${expect.capUsdc} USDC cap. Raise --max-usdc only if intended.`,
+    );
+  }
+  // When the caller pins the recipient (--confirm-pay-to on settle), it must match
+  // exactly. The MPP recipient is not escrow-pinned (per-merchant, server-derived),
+  // so this closes the same honest-at-DRY / swap-at-SETTLE gap the x402-direct path
+  // closes: the recipient the human confirmed is the recipient settled to.
+  if (expect.confirmPayTo !== undefined && recipient !== expect.confirmPayTo.toLowerCase()) {
+    throw new Error(
+      `MPP challenge recipient ${recipient} does not match the confirmed --confirm-pay-to ${expect.confirmPayTo.toLowerCase()}. Refusing.`,
+    );
+  }
+  return priceAtomic;
+}
+
+// Whether an MPP charge must be REFUSED to avoid bypassing escrow. MPP settles
+// x402-direct (no escrow, no buyer protection), so if the reservation's merchant
+// advertises the Boson escrow handler, charging via MPP would forgo the protection
+// that merchant offers. In that case the client refuses and sends the caller to
+// `buy`, which settles into escrow. The signal is the merchant's OWN advertised
+// handlers on the reservation's checkout session (per-merchant), not the Terminal's
+// global rail capability. Pure and exported for offline testing.
+export function mppRefusedForEscrow(paymentHandlers: Record<string, unknown> | undefined): boolean {
+  const handlers = paymentHandlers ?? {};
+  return Object.prototype.hasOwnProperty.call(handlers, BOSON_HANDLER);
+}
+
+// Decode a KYA's identity claims (aid, issuer, expiry) from the token's JWT
+// payload, for the provenance record. The KYA is a bearer credential, so this
+// NEVER returns the raw token: it splits the JWT and reads only the middle
+// (payload) segment's claims, and it does not verify the signature (the caller
+// already trusts its own wallet-bound token). Pure and exported for offline
+// testing. Returns null for anything that is not a decodable JWT.
+export function kyaIdentity(
+  kya: string | undefined,
+): { aid: string | null; issuer: string | null; expires: number | null } | null {
+  if (typeof kya !== "string" || kya === "") return null;
+  const parts = kya.split(".");
+  if (parts.length < 2) return null;
+  try {
+    const claims = b64urlToJson(parts[1]) as Record<string, unknown>;
+    return {
+      aid: typeof claims.aid === "string" ? claims.aid : null,
+      issuer: typeof claims.iss === "string" ? claims.iss : null,
+      expires: typeof claims.exp === "number" ? claims.exp : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Assemble the client-side provenance record: the identity and signature legs this
+// client presented and received during one purchase. It NEVER carries a raw bearer
+// token or a wallet key: the identity is the KYA's decoded claims (aid/issuer/exp),
+// the payment is the buyer's own signature leg (an ERC-3009 authorization on the
+// x402/MPP rail, or the Boson commit authorization on escrow), and the response is
+// the Terminal's Ed25519-signed receipt and whether it verified offline against the
+// merchant's JWKS. This is the full chain from the CLIENT'S vantage. It cannot
+// include the platform's `ucp_platform_rfc9421` co-signature: the platform adds that
+// server-side, the Terminal records it (with the KYA and ERC-3009 legs) in its own
+// FORCE-RLS-locked signatures ledger, and no buyer-facing endpoint exposes that
+// ledger. Pure and exported for offline testing.
+export function buildProvenance(input: {
+  rail: string;
+  kya?: string;
+  payment: Record<string, unknown>;
+  checkoutId?: string | null;
+  orderId?: string | null;
+  settlementId?: string | null;
+  receipt?: Record<string, unknown> | null;
+}): Record<string, unknown> {
+  const receipt = input.receipt ?? null;
+  const signedReceipt = receipt !== null && typeof receipt.jws === "string" && receipt.jws !== "";
+  // verified is a tri-state: true / false when the receipt was verified inline on
+  // this path, null when it was not (the buyer can still verify it later with
+  // `receipt --order-id`, which fetches and checks the same JWS offline).
+  const verified = receipt !== null && typeof receipt.verified === "boolean" ? receipt.verified : null;
+  return {
+    identity: kyaIdentity(input.kya),
+    payment: { rail: input.rail, ...input.payment },
+    settlement: {
+      checkout_id: input.checkoutId ?? null,
+      order_id: input.orderId ?? null,
+      settlement_id: input.settlementId ?? null,
+    },
+    response: {
+      signed_receipt: signedReceipt,
+      verified,
+      ...(receipt !== null && typeof receipt.kid === "string" ? { kid: receipt.kid } : {}),
+      ...(receipt !== null && typeof receipt.provider_jwks === "string" ? { jwks: receipt.provider_jwks } : {}),
+    },
+    note:
+      "Client-side provenance: the identity and signatures this client presented and received. The " +
+      "Terminal's full server-side audit trail (KYA authorizations, the platform RFC 9421 co-signature, " +
+      "the ERC-3009 payment authorization) is recorded in its signatures ledger and read back over the " +
+      "owner-scoped get_signatures endpoint, rendered in the receipt's authorization trail.",
+  };
+}
+
+// Extract the legible signatures from a Boson commit x_payment (a base64
+// createOfferAndCommit meta-tx) for the provenance record, instead of dumping the
+// whole multi-KB blob. It carries two real signatures: the buyer's ERC-3009 token
+// authorization (the exact USDC transfer it authorizes, plus the v/r/s the wallet
+// signed) and the seller's offer signature. Returns null if the blob is not
+// decodable base64 JSON. Pure and exported for offline testing.
+export function decodeBosonCommit(xPayment: string): {
+  token_authorization: { from: string; to: string; value: string; nonce: string } | null;
+  buyer_signature: { v: number; r: string; s: string } | null;
+  seller_signature: string | null;
+} | null {
+  try {
+    const decoded = JSON.parse(atob(xPayment)) as { payload?: Record<string, unknown> };
+    const payload = (decoded.payload ?? {}) as {
+      tokenAuth?: { data?: Record<string, unknown> };
+      offerRef?: { sellerSig?: unknown };
+    };
+    const ta = payload.tokenAuth?.data;
+    const sellerSig = payload.offerRef?.sellerSig;
+    return {
+      token_authorization: ta !== undefined && typeof ta.from === "string"
+        ? { from: String(ta.from), to: String(ta.to), value: String(ta.value), nonce: String(ta.nonce) }
+        : null,
+      buyer_signature: ta !== undefined && typeof ta.r === "string"
+        ? { v: Number(ta.v), r: String(ta.r), s: String(ta.s) }
+        : null,
+      seller_signature: typeof sellerSig === "string" ? sellerSig : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 // Map a FACET_RAIL preference to an explicit UCP rail_id, or undefined to let
 // the Terminal pick the merchant's OMS-keyed default (Shopify => x402-direct,
 // Woo => Boson escrow). "x402" forces the direct coin rail on the active
@@ -971,6 +1167,335 @@ export function errorReason(text: string): string {
   } catch {
     return "";
   }
+}
+
+// ---- mpp-charge: settle a held reservation through the Machine Payments
+//      Protocol (mpp.dev) charge envelope. MPP is not a new rail: it is the same
+//      on-chain x402 settlement leg re-dressed in mpp.dev's challenge / credential
+//      / receipt shape, so an mpp.dev-native agent can pay a Facet order with no
+//      Facet-specific checkout code. The reservation comes first: a UCP checkout
+//      session id (from `buy` DRY, which prints checkout_id) or a POST /v1/reserve
+//      id both hold a priced reservation this route can charge. The flow:
+//        1. Probe POST {base}/mpp/v1/charges {reservation_id} with NO credential to
+//           draw the 402. Amount, recipient, currency and chain are all server-
+//           derived from the reservation and the merchant's own payout row and
+//           ride the WWW-Authenticate challenge; the client never writes them.
+//        2. Verify those terms against our own client-side expectations
+//           (assertMppTerms) BEFORE any signature. DRY stops here; nothing signed.
+//        3. On --settle (with an exact --confirm of the amount AND --confirm-pay-to
+//           of the recipient), let mppx build the evm/charge credential: an ERC-3009
+//           TransferWithAuthorization whose nonce is bound to this challenge,
+//           signed LOCALLY by the wallet, then resubmit it as `Authorization:
+//           Payment <base64url>`. The key never leaves the process; USDC moves
+//           straight from the wallet to the merchant. The receipt (on-chain ref)
+//           rides the Payment-Receipt response header.
+//      Because MPP settles x402-direct (no escrow), it must never stand in for an
+//      escrow checkout: BEFORE charging, the client reads the reservation's own
+//      checkout session and REFUSES if the merchant advertises Boson escrow, sending
+//      the caller to `buy` instead (no bypassing escrow). That guard read is
+//      owner-scoped, so it presents the wallet's KYA; the charge credential itself
+//      still carries no KYA (the unguessable reservation id is the capability and the
+//      credential moves the SIGNER's own funds, MPP-Auth: payment-scheme).
+async function cmdMppCharge(flags: Record<string, string | boolean>): Promise<never> {
+  const base = terminalBase(requireFlag(flags, "terminal"));
+  const reservationId = requireFlag(flags, "reservation-id").trim();
+  const mppEndpoint = `${base}/mpp/v1/charges`;
+  const settle = flags.settle === true;
+
+  const requestedCap = flags["max-usdc"] !== undefined ? Number(flags["max-usdc"]) : DEFAULT_MAX_USDC;
+  if (!Number.isFinite(requestedCap) || requestedCap <= 0) die("--max-usdc must be a positive number.");
+  const capUsdc = Math.min(requestedCap, MAX_USDC_CEILING);
+  if (capUsdc < requestedCap) {
+    note(`--max-usdc ${requestedCap} exceeds the ${MAX_USDC_CEILING} USDC ceiling; clamping to ${capUsdc}.`);
+  }
+  const capAtomic = Math.round(capUsdc * 1e6);
+
+  const wallet = resolveWallet(typeof flags.wallet === "string" ? flags.wallet : undefined);
+  const account = privateKeyToAccount(wallet.key as `0x${string}`);
+  note(`buyer wallet [${wallet.label}]: ${account.address}`);
+
+  // ---- ESCROW GUARD (before anything else): MPP settles x402-direct with no
+  // escrow. If this reservation's merchant offers Boson escrow, charging via MPP
+  // would bypass the buyer protection they offer, so refuse and send the caller to
+  // `buy`. Read the merchant's OWN advertised rails from the reservation's checkout
+  // session (owner-scoped: the same wallet that reserved reads it), so the decision
+  // is per-merchant, not from the Terminal's global rail capability. FAIL CLOSED: if
+  // the rails cannot be confirmed x402-only, do not settle. The charge credential
+  // itself still carries no KYA; this read is only the guard. ----
+  const guardKya = await walletBoundKya(wallet);
+  const sessionUrl = `${base}/ucp/v1/checkout-sessions/${encodeURIComponent(reservationId)}`;
+  note(`GET ${sessionUrl}  (escrow guard: read the reservation's rails)`);
+  let sessRes: Response;
+  try {
+    sessRes = await fetch(sessionUrl, { headers: kyaHeaders(guardKya) });
+  } catch (e) {
+    die(
+      `escrow guard: could not read the reservation's checkout session ` +
+        `(${e instanceof Error ? e.message : String(e)}). Refusing to settle without confirming the ` +
+        `merchant is x402-only, to avoid bypassing escrow.`,
+    );
+  }
+  const sessText = await sessRes.text();
+  if (sessRes.status !== 200) {
+    die(
+      `escrow guard: could not read the reservation's checkout session (HTTP ${sessRes.status}). The ` +
+        `reservation must belong to this wallet [${wallet.label}]. Refusing to settle without confirming ` +
+        `the merchant is x402-only, to avoid bypassing escrow.`,
+      { http_status: sessRes.status, body: sessText.slice(0, 300) },
+    );
+  }
+  const guardSession = parseJsonObjOrDie(sessText, "checkout session") as {
+    payment_handlers?: Record<string, unknown>;
+    default_rail?: string;
+  };
+  if (mppRefusedForEscrow(guardSession.payment_handlers)) {
+    die(
+      `this merchant offers Boson escrow (buyer protection), so MPP is refused here: MPP settles ` +
+        `x402-direct with no escrow and would bypass that protection. Use \`buy\` to check out into escrow.`,
+      {
+        reason: "escrow_available_mpp_refused",
+        default_rail: typeof guardSession.default_rail === "string" ? guardSession.default_rail : null,
+        advertised_rails: Object.keys(guardSession.payment_handlers ?? {}),
+        use_instead: "buy",
+      },
+    );
+  }
+  note(`escrow guard passed: merchant is x402-only (no Boson escrow handler advertised)`);
+
+  // The mpp.dev client. The evm/charge method's own policy (networks / currencies /
+  // maxAtomicAmount) is a belt-and-suspenders check UNDER our own assertMppTerms:
+  // it throws inside createCredential if the server ever slips a term the pre-sign
+  // guardrail missed. polyfill:false leaves globalThis.fetch untouched; we drive
+  // rawFetch explicitly so the guardrail sits between the 402 and the signature.
+  const mppx = Mppx.create({
+    methods: [mppEvmCharge({
+      // viem 2.50.4 (the skill's pin) vs mppx's peer range >=2.54.0: Deno resolves
+      // ONE viem at runtime, but types the account under two nominally-distinct
+      // copies of viem's Account, so the structurally-identical PrivateKeyAccount
+      // needs a cast to the Account type this mppx build declares. Runtime-safe.
+      account: account as unknown as NonNullable<Parameters<typeof mppEvmCharge>[0]["account"]>,
+      networks: [EXPECT_CHAIN],
+      currencies: [USDC],
+      maxAtomicAmount: String(capAtomic),
+    })],
+    polyfill: false,
+  });
+
+  // ---- PROBE: POST with no credential to draw the 402 challenge. ----
+  note(`POST ${mppEndpoint}  (probe: no credential -> 402 challenge)`);
+  let res402: Response;
+  try {
+    res402 = await mppx.rawFetch(mppEndpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ reservation_id: reservationId }),
+    });
+  } catch (e) {
+    die(`could not reach the MPP charge endpoint: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  const probeText = await res402.clone().text();
+  if (res402.status === 404) {
+    die(`this Terminal does not serve MPP (${mppEndpoint} returned 404). Use the UCP checkout (buy) instead.`, {
+      mpp_enabled: false,
+      body: probeText.slice(0, 300),
+    });
+  }
+  if (res402.status !== 402) {
+    die(`expected a 402 challenge from the MPP charge probe, got HTTP ${res402.status}.`, {
+      http_status: res402.status,
+      body: probeText.slice(0, 400),
+    });
+  }
+
+  // ---- PARSE the challenge from the WWW-Authenticate header (mppx owns the wire
+  // format). The evm/charge request carries the server-resolved terms. ----
+  let challenge: MppChallenge.Challenge;
+  try {
+    challenge = MppChallenge.fromResponse(res402) as MppChallenge.Challenge;
+  } catch (e) {
+    die(`could not parse the MPP 402 challenge: ${e instanceof Error ? e.message : String(e)}`, {
+      body: probeText.slice(0, 400),
+    });
+  }
+  const request = (challenge.request ?? {}) as {
+    amount?: string;
+    currency?: string;
+    recipient?: string;
+    methodDetails?: { chainId?: number };
+  };
+  const chalRecipient = String(request.recipient ?? "");
+  const chalAmount = String(request.amount ?? "");
+  const chalCurrency = String(request.currency ?? "");
+  const chalChain = Number(request.methodDetails?.chainId ?? NaN);
+
+  // ---- GUARDRAIL: verify the server-set terms BEFORE any signature. On settle,
+  // also bind the recipient to --confirm-pay-to (checked again explicitly below so
+  // the caller cannot settle without having seen it). ----
+  const confirmPayToFlag = typeof flags["confirm-pay-to"] === "string"
+    ? String(flags["confirm-pay-to"])
+    : undefined;
+  let priceAtomic: number;
+  try {
+    priceAtomic = assertMppTerms(
+      { recipient: chalRecipient, amountAtomic: chalAmount, currency: chalCurrency, chainId: chalChain },
+      {
+        chainId: EXPECT_CHAIN,
+        usdc: USDC,
+        capAtomic,
+        capUsdc,
+        confirmPayTo: settle ? confirmPayToFlag : undefined,
+      },
+    );
+  } catch (e) {
+    die(`GUARDRAIL: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  const recipientLc = chalRecipient.toLowerCase();
+  const summary = {
+    reservation_id: reservationId,
+    mpp_endpoint: mppEndpoint,
+    method: `${challenge.method}/${challenge.intent}`,
+    chain_id: chalChain,
+    network: EXPECT_NETWORK,
+    price_atomic: priceAtomic,
+    price_usdc: priceAtomic / 1e6,
+    recipient: recipientLc,
+    currency: chalCurrency,
+    buyer: account.address,
+    wallet: wallet.label,
+  };
+
+  // ---- DRY (default): stop at the verified challenge. Nothing signed. ----
+  if (!settle) {
+    emit({
+      ok: true,
+      mode: "DRY",
+      ...summary,
+      signed: false,
+      settled: false,
+      confirm_atomic: priceAtomic,
+      confirm_pay_to: recipientLc,
+      next: `to settle: mpp-charge --terminal ${base} --reservation-id ${reservationId} ` +
+        `--settle --confirm ${priceAtomic} --confirm-pay-to ${recipientLc}`,
+      message: `Ready to charge ${priceAtomic / 1e6} USDC via MPP evm/charge to ${recipientLc}. ` +
+        `Nothing has moved. Confirm the amount AND the recipient with the user, then settle with ` +
+        `--confirm ${priceAtomic} --confirm-pay-to ${recipientLc}.`,
+    });
+  }
+
+  // ---- SETTLE: require an exact --confirm of BOTH the amount AND the recipient,
+  // the same discipline as x402-direct (the MPP recipient is not escrow-pinned, so
+  // the human who saw it at DRY must confirm it before any signature). ----
+  const confirm = flags.confirm;
+  if (typeof confirm !== "string" || Number(confirm) !== priceAtomic) {
+    die(
+      `settle refused: --confirm must equal the freshly-challenged amount ${priceAtomic} (atomic). ` +
+        `Run the DRY mpp-charge again, show the user ${priceAtomic / 1e6} USDC, then settle with --confirm ${priceAtomic}.`,
+      { expected_confirm_atomic: priceAtomic },
+    );
+  }
+  if (confirmPayToFlag === undefined || confirmPayToFlag.toLowerCase() !== recipientLc) {
+    die(
+      `settle refused: --confirm-pay-to must equal the freshly-challenged recipient ${recipientLc}. ` +
+        `The MPP recipient is not escrow-pinned, so confirm it: run the DRY mpp-charge again, show the ` +
+        `user ${recipientLc}, then settle with --confirm-pay-to ${recipientLc}.`,
+      { expected_confirm_pay_to: recipientLc },
+    );
+  }
+
+  // ---- Build the evm/charge credential (mppx signs the ERC-3009 locally, nonce
+  // bound to the challenge) and resubmit it as Authorization: Payment. ----
+  let credential: string;
+  try {
+    credential = await mppx.createCredential(res402);
+  } catch (e) {
+    die(`could not build the MPP charge credential: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  note(`buyer charge signed locally (evm/charge ERC-3009, own wallet -> ${recipientLc}); resubmitting`);
+  let paidRes: Response;
+  try {
+    paidRes = await mppx.rawFetch(mppEndpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json", "authorization": `Payment ${credential}` },
+      body: JSON.stringify({ reservation_id: reservationId }),
+    });
+  } catch (e) {
+    die(`MPP charge resubmit failed: ${e instanceof Error ? e.message : String(e)}`, {
+      settled: "unconfirmed",
+      warning: "the credential was signed and the resubmit threw; DO NOT retry blindly. " +
+        "Verify the order and on-chain state first.",
+    });
+  }
+  const paidText = await paidRes.clone().text();
+  if (paidRes.status < 200 || paidRes.status >= 300) {
+    // A 402 here means the credential was refused (bad term, replay, expired). The
+    // body is an RFC 9457 problem+json naming which, and `retryable` says whether a
+    // fresh signature can help, so surface it rather than swallow it.
+    die(`MPP charge was refused HTTP ${paidRes.status}.`, {
+      http_status: paidRes.status,
+      body: paidText.slice(0, 600),
+    });
+  }
+
+  // ---- Receipt: mpp.dev returns it on the Payment-Receipt header (base64url JSON:
+  // method, on-chain reference, externalId, status, timestamp). ----
+  let receipt: MppReceipt.Receipt | null = null;
+  try {
+    receipt = MppReceipt.fromResponse(paidRes);
+  } catch {
+    // Header absent or unparseable; fall through with the raw body so the caller
+    // still learns the charge was accepted (HTTP 2xx) even without a parsed receipt.
+  }
+
+  // The Facet order id, from the 200 JSON body ({ status, order: { id }, ... }). MPP
+  // has no refund leg of its own: an MPP charge is an x402-direct order, so a later
+  // refund runs through the standard `refund --order-id` -> merchant approve -> x402
+  // send-back. Surface the order id here so that refund is reachable; the mpp.dev
+  // receipt header only carries the reservation id (externalId) and the on-chain ref.
+  let orderId: string | null = null;
+  try {
+    const paidBody = JSON.parse(paidText);
+    const ord = paidBody?.order;
+    if (ord !== null && typeof ord === "object" && typeof ord.id === "string" && ord.id !== "") {
+      orderId = ord.id;
+    }
+  } catch {
+    // Body not JSON (a receipt-header-only response); order id stays null.
+  }
+
+  emit({
+    ok: true,
+    mode: "SETTLE",
+    ...summary,
+    signed: true,
+    settled: true,
+    order_id: orderId,
+    reference: receipt?.reference ?? null,
+    external_id: receipt?.externalId ?? reservationId,
+    receipt_status: receipt?.status ?? null,
+    receipt_timestamp: receipt?.timestamp ?? null,
+    provenance: buildProvenance({
+      rail: "mpp",
+      kya: guardKya,
+      payment: {
+        method: `${challenge.method}/${challenge.intent}`,
+        recipient: recipientLc,
+        amount_atomic: priceAtomic,
+      },
+      checkoutId: reservationId,
+      orderId,
+      settlementId: receipt?.reference ?? null,
+      // MPP returns an mpp.dev receipt (see reference / receipt_status above), not a
+      // Facet Ed25519 JWS, so there is no signed-receipt leg to verify here.
+      receipt: null,
+    }),
+    ...(receipt === null ? { warning: "settlement accepted but no Payment-Receipt header parsed", body: paidText.slice(0, 500) } : {}),
+    refund: orderId !== null
+      ? `MPP is x402-direct (no escrow): to refund, run \`refund --order-id ${orderId} --reason "..."\`; the merchant approve sends the USDC back from its payout wallet.`
+      : `MPP is x402-direct (no escrow): refund via \`refund --order-id <id>\` once you have the order id (look it up in your order history).`,
+    message: `MPP charge settled: ${priceAtomic / 1e6} USDC to ${recipientLc}` +
+      (receipt?.reference ? `, on-chain ref ${receipt.reference}` : "") + ".",
+  });
 }
 
 async function cmdBuy(flags: Record<string, string | boolean>): Promise<never> {
@@ -1184,8 +1709,6 @@ async function cmdBuy(flags: Record<string, string | boolean>): Promise<never> {
   }
   if (railArm === "x402" && x402cfg !== undefined) {
     // ==== x402-direct settlement path ======================================
-    // ONE code path for both planes (FACET_NETWORK selects chain/USDC/domain), a
-    // proxy of the mainnet x402 walker scripts/x402-demo/pnp-ucp-2item-mainnet.ts.
     // The buyer's ERC-3009 authorizes USDC straight to the merchant pay_to (no
     // escrow, no buyer protection): Facet custodies neither funds nor keys. The
     // platform RFC 9421 co-signature is added by the origination surface, same as
@@ -1431,6 +1954,15 @@ async function cmdBuy(flags: Record<string, string | boolean>): Promise<never> {
       settlement_id: completion.settlement_id ?? null,
       settled_at: completion.settled_at ?? null,
       receipt,
+      provenance: buildProvenance({
+        rail: "x402",
+        kya: buyKya,
+        payment: { authorization, signature: erc3009Signature, pay_to: advPayTo },
+        checkoutId: session.id,
+        orderId: settledOrderId,
+        settlementId: typeof completion.settlement_id === "string" ? completion.settlement_id : null,
+        receipt: receipt === null ? null : (receipt as unknown as Record<string, unknown>),
+      }),
       message: `Settled ${priceAtomic / 1e6} USDC via x402-direct to ${advPayTo}.`,
     });
   }
@@ -1653,7 +2185,34 @@ async function cmdBuy(flags: Record<string, string | boolean>): Promise<never> {
   // later.
   const settledOrderId = (completion.order as { id?: string } | undefined)?.id ??
     (typeof completion.order_id === "string" ? completion.order_id : null);
+  // Legible payment leg: the buyer's ERC-3009 token authorization and the seller's
+  // offer signature, extracted from the Boson commit rather than the raw multi-KB
+  // blob. Falls back to the raw commit if it cannot be decoded.
+  const bosonSigs = decodeBosonCommit(xPayment);
+  const bosonPayment: Record<string, unknown> = bosonSigs !== null
+    ? {
+      token_authorization: bosonSigs.token_authorization,
+      buyer_signature: bosonSigs.buyer_signature,
+      seller_signature: bosonSigs.seller_signature,
+      escrow: BOSON_ESCROW,
+    }
+    : { commit_authorization: xPayment, escrow: BOSON_ESCROW };
+  const buildBosonProvenance = (receiptInfo: Record<string, unknown> | null) =>
+    buildProvenance({
+      rail: "boson",
+      kya: buyKya,
+      payment: bosonPayment,
+      checkoutId: session.id,
+      orderId: settledOrderId,
+      settlementId: typeof completion.settlement_id === "string" ? completion.settlement_id : null,
+      receipt: receiptInfo,
+    });
   let receipt: Record<string, unknown> | null = null;
+  // Computed once, archived alongside the receipt so a later `render-receipt` can
+  // show the full identity -> payment -> settlement -> verification chain, and
+  // echoed in the result. Starts without the verified-receipt leg; rebuilt with it
+  // once the receipt is fetched below.
+  let provenance: Record<string, unknown> = buildBosonProvenance(null);
   if (typeof settledOrderId === "string" && settledOrderId !== "") {
     let { entry, note: rnote, status } = await fetchReceipt(base, settledOrderId, buyKya);
     // On an originated (platform-signed) checkout the settled order is owned by the
@@ -1668,15 +2227,11 @@ async function cmdBuy(flags: Record<string, string | boolean>): Promise<never> {
     }
     if (entry !== null) {
       const v = await verifyReceipt(entry, base);
-      const saved = saveReceipt(base, settledOrderId, entry, v.verified === true);
-      receipt = {
-        jws: entry.jws,
-        kid: entry.kid,
-        provider_jwks: entry.provider_jwks,
-        ...v,
-        saved: saved.saved,
-        ...(saved.path !== undefined ? { saved_path: saved.path } : {}),
-      };
+      receipt = { jws: entry.jws, kid: entry.kid, provider_jwks: entry.provider_jwks, ...v };
+      provenance = buildBosonProvenance(receipt);
+      const saved = saveReceipt(base, settledOrderId, entry, v.verified === true, provenance);
+      receipt.saved = saved.saved;
+      if (saved.path !== undefined) receipt.saved_path = saved.path;
     } else {
       receipt = { available: false, note: rnote };
     }
@@ -1690,6 +2245,7 @@ async function cmdBuy(flags: Record<string, string | boolean>): Promise<never> {
     order_id: settledOrderId,
     settlement_id: completion.settlement_id ?? null,
     receipt,
+    provenance,
     settlement: completion,
   });
 }
@@ -1743,7 +2299,7 @@ function bosonSignClient(walletKey: string): {
 
 // Sign a single-factor Boson action (redeem, cancel, raise/retract/escalate) as a
 // gasless buyer meta-tx.
-async function signBosonAction(
+export async function signBosonAction(
   walletKey: string,
   actionId: string,
   exchangeId: string,
@@ -1783,7 +2339,7 @@ async function signBosonResolve(
 // Resolve a trusted, wallet-bound KYA for a wallet, self-serve minting one if the
 // env or cached token is stale, untrusted, or absent. Mirrors buy's identity
 // self-heal so every lifecycle action authenticates as the same wallet-bound agent.
-async function walletBoundKya(wallet: ResolvedWallet): Promise<string> {
+export async function walletBoundKya(wallet: ResolvedWallet): Promise<string> {
   let kya = kyaUsable(wallet.kya, wallet.address) ? wallet.kya : "";
   if (kya === "") {
     const cached = readCachedKya(wallet.label);
@@ -1983,7 +2539,7 @@ async function cmdCancel(flags: Record<string, string | boolean>): Promise<never
 }
 
 // ---- dispute: raise / retract / escalate a dispute -------------------------
-const DISPUTE_ACTION_ID: Record<string, string> = {
+export const DISPUTE_ACTION_ID: Record<string, string> = {
   raise: "boson-raiseDispute",
   retract: "boson-retractDispute",
   escalate: "boson-escalateDispute",
@@ -3106,6 +3662,55 @@ async function fetchReceipt(
   }
 }
 
+// Fetch the server-recorded signature audit trail for an order (get_signatures):
+// the two RLS-locked ledgers the Terminal keeps, the outbound Facet response
+// signatures plus the inbound authorizations (the KYA by hash, the UCP RFC 9421
+// platform signature, the ERC-3009 payment authorization, the seller offer).
+// Owner-scoped exactly like get_receipt; the caller passes a wallet_auth proof to
+// re-read a platform-originated order it paid for. Best effort: returns
+// {trail:null} on any non-2xx or parse failure, so the receipt still renders
+// without the trail when the endpoint is unavailable.
+type ServerTrail = {
+  signatures: Record<string, unknown>[];
+  authorizations: Record<string, unknown>[];
+};
+
+async function fetchSignatures(
+  base: string,
+  orderId: string,
+  kya: string,
+  walletAuth?: Record<string, unknown>,
+): Promise<{ trail: ServerTrail | null; status: number }> {
+  try {
+    const r = await fetch(`${base}/v1/get_signatures`, {
+      method: "POST",
+      headers: kyaHeaders(kya),
+      body: JSON.stringify(
+        walletAuth !== undefined ? { order_id: orderId, wallet_auth: walletAuth } : { order_id: orderId },
+      ),
+    });
+    const text = await r.text();
+    if (r.status < 200 || r.status >= 300) return { trail: null, status: r.status };
+    try {
+      const body = JSON.parse(text) as {
+        signatures?: Record<string, unknown>[];
+        authorizations?: Record<string, unknown>[];
+      };
+      return {
+        trail: {
+          signatures: Array.isArray(body.signatures) ? body.signatures : [],
+          authorizations: Array.isArray(body.authorizations) ? body.authorizations : [],
+        },
+        status: r.status,
+      };
+    } catch {
+      return { trail: null, status: r.status };
+    }
+  } catch {
+    return { trail: null, status: 0 };
+  }
+}
+
 // Sign the canonical receipt-refetch challenge locally with the wallet, proving
 // control of the order's payer wallet WITHOUT the (expired) purchase KYA. The
 // address is derived from the key, so it is always the checksummed form the
@@ -3122,6 +3727,25 @@ async function walletReceiptAuth(
   const nonce = crypto.randomUUID();
   const message =
     `Facet receipt refetch\norder: ${orderId}\nwallet: ${wallet}\nissued_at: ${issued_at}\nnonce: ${nonce}`;
+  const signature = await account.signMessage({ message });
+  return { wallet, issued_at, nonce, signature };
+}
+
+// The get_signatures counterpart of walletReceiptAuth. Signs the DISTINCT
+// signatures-refetch challenge (not the receipt one), so a proof for one read can
+// never authorize the other. Must match the Terminal's signaturesRefetchChallenge
+// exactly. The key never leaves this process; only the signature, nonce, and
+// issued-at do.
+async function walletSignaturesAuth(
+  walletKey: string,
+  orderId: string,
+): Promise<Record<string, unknown>> {
+  const account = privateKeyToAccount(walletKey as `0x${string}`);
+  const wallet = account.address;
+  const issued_at = Math.floor(Date.now() / 1000);
+  const nonce = crypto.randomUUID();
+  const message =
+    `Facet signatures refetch\norder: ${orderId}\nwallet: ${wallet}\nissued_at: ${issued_at}\nnonce: ${nonce}`;
   const signature = await account.signMessage({ message });
   return { wallet, issued_at, nonce, signature };
 }
@@ -3235,6 +3859,7 @@ function saveReceipt(
   orderId: string,
   entry: ReceiptEntry,
   verified: boolean | null,
+  provenance?: Record<string, unknown> | null,
 ): { saved: boolean; path?: string; note?: string } {
   const dir = receiptsDir();
   let claims: Record<string, unknown> = {};
@@ -3254,6 +3879,10 @@ function saveReceipt(
     provider_jwks: entry.provider_jwks,
     verified,
     claims,
+    // The client-side provenance chain (identity -> payment -> settlement ->
+    // verification), archived so `render-receipt` can show it for a past order.
+    // Absent on a plain re-fetch (get_receipt returns no provenance).
+    ...(provenance !== undefined && provenance !== null ? { provenance } : {}),
     saved_at: savedAt,
   };
   try {
@@ -3483,6 +4112,213 @@ async function cmdLifecycleReceipt(flags: Record<string, string | boolean>): Pro
   });
 }
 
+// ---- render-receipt: turn a settled order's receipt into the OFFICIAL, self-
+//      contained, self-verifying HTML page (references/receipt-template.html).
+//      This is the one canonical rendering: the page derives every field from the
+//      embedded signed JWS, embeds the merchant's Ed25519 public key so the verify
+//      seal is a real in-browser check, and renders the identity -> payment ->
+//      settlement -> verification provenance chain when it is available. Provenance
+//      comes from the archive a `buy --settle` wrote (get_receipt itself carries
+//      none), or from an explicit --provenance-file. Writes the HTML and returns its
+//      path; nothing about the receipt is secret, so the file is shareable.
+async function cmdRenderReceipt(flags: Record<string, string | boolean>): Promise<never> {
+  const base = terminalBase(requireFlag(flags, "terminal"));
+  const orderId = requireFlag(flags, "order-id").trim();
+  const wallet = resolveWallet(typeof flags.wallet === "string" ? flags.wallet : undefined);
+  const buyKya = await walletBoundKya(wallet);
+
+  // Fetch the signed receipt (owner-scoped; re-authorize with the paying wallet on a 403).
+  let { entry, note: rnote, status } = await fetchReceipt(base, orderId, buyKya);
+  if (entry === null && status === 403) {
+    const walletAuth = await walletReceiptAuth(wallet.key, orderId);
+    ({ entry, note: rnote, status } = await fetchReceipt(base, orderId, buyKya, walletAuth));
+  }
+  if (entry === null) die(`could not fetch the receipt for ${orderId}: ${rnote}`, { http_status: status });
+  const jws = entry.jws;
+  if (typeof jws !== "string" || jws === "") die(`the receipt for ${orderId} has no JWS to render.`);
+  const header = b64urlToJson((jws.split(".")[0]) ?? "");
+  const claims = b64urlToJson((jws.split(".")[1]) ?? "");
+  const iss = typeof claims.iss === "string" ? claims.iss : base;
+  const merchantHost = hostOf(iss);
+  const verified = await verifyReceipt(entry, base);
+
+  // Fetch the merchant JWKS and pick the Ed25519 pubkey for the receipt's kid, so
+  // the rendered page can verify the signature in the browser.
+  let pubkeyX: string | null = null;
+  try {
+    const jwksRes = await fetch(`${iss.replace(/\/$/, "")}/.well-known/jwks.json`);
+    if (jwksRes.ok) {
+      pubkeyX = pubkeyXForKid(await jwksRes.json(), typeof header.kid === "string" ? header.kid : "");
+    }
+  } catch {
+    // No JWKS reachable: the page shows the offline verdict already computed at fetch.
+  }
+
+  // Provenance: an explicit --provenance-file wins; else the provenance a prior
+  // `buy --settle` archived alongside the receipt (get_receipt carries none itself).
+  let provenance: Record<string, unknown> | null = null;
+  const provFile = typeof flags["provenance-file"] === "string" ? flags["provenance-file"] : "";
+  if (provFile !== "") {
+    try {
+      provenance = JSON.parse(await Deno.readTextFile(provFile)) as Record<string, unknown>;
+    } catch (e) {
+      die(`could not read --provenance-file: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  } else {
+    try {
+      const archived = JSON.parse(await Deno.readTextFile(`${receiptsDir()}/${orderId}.json`)) as {
+        provenance?: Record<string, unknown>;
+      };
+      if (archived !== null && typeof archived === "object" && archived.provenance) {
+        provenance = archived.provenance;
+      }
+    } catch {
+      // No archive for this order; render without the provenance section.
+    }
+  }
+
+  // Resolve the order's line items (the signed receipt carries none). An explicit
+  // --items-file (a JSON array of {name, sku, qty, amount_minor?}, e.g. saved from a
+  // buy result) wins. Otherwise read them from order_history (owner-scoped to this
+  // KYA's aid) and each SKU's display name from get_product; that works for a
+  // buyer-owned order, but a platform-originated order is owned by the origin aid and
+  // is not returned to the buyer, so its receipt renders the money breakdown alone.
+  const items: Array<{ name: string; sku: string; qty: number; amount_minor?: number }> = [];
+  const itemsFile = typeof flags["items-file"] === "string" ? flags["items-file"] : "";
+  if (itemsFile !== "") {
+    try {
+      const parsed = JSON.parse(await Deno.readTextFile(itemsFile)) as Array<Record<string, unknown>>;
+      if (Array.isArray(parsed)) {
+        for (const it of parsed) {
+          if (it !== null && typeof it === "object" && typeof it.sku === "string" && it.sku !== "") {
+            items.push({
+              name: typeof it.name === "string" && it.name !== "" ? it.name : it.sku,
+              sku: it.sku,
+              qty: Number(it.qty ?? 1),
+              ...(typeof it.amount_minor === "number" ? { amount_minor: it.amount_minor } : {}),
+            });
+          }
+        }
+      }
+    } catch (e) {
+      die(`could not read --items-file: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  if (items.length === 0) {
+    try {
+      const hRes = await fetch(`${base}/v1/order_history`, {
+        method: "POST",
+        headers: kyaHeaders(buyKya),
+        body: JSON.stringify({ limit: 50 }),
+      });
+      if (hRes.ok) {
+        const hist = parseJsonObjOrDie(await hRes.text(), "order_history") as {
+          orders?: Array<Record<string, unknown>>;
+        };
+        const order = (hist.orders ?? []).find((o) => String(o.order_id ?? "") === orderId);
+        const lineItems = (order?.line_items as
+          | Array<{ product_id?: string; qty?: number; unit_price?: number }>
+          | undefined) ?? [];
+        for (const li of lineItems) {
+          const sku = String(li.product_id ?? "");
+          if (sku === "") continue;
+          const qty = Number(li.qty ?? 1);
+          let name = sku;
+          try {
+            const pRes = await fetch(`${base}/v1/get_product`, {
+              method: "POST",
+              headers: kyaHeaders(buyKya),
+              body: JSON.stringify({ product_id: sku }),
+            });
+            if (pRes.ok) {
+              const body = parseJsonObjOrDie(await pRes.text(), "get_product");
+              const prod = ((body.product ?? body) as { name?: unknown });
+              if (typeof prod.name === "string" && prod.name !== "") name = prod.name;
+            }
+          } catch {
+            // Keep the SKU as the display name.
+          }
+          const amountMinor = typeof li.unit_price === "number"
+            ? Math.round(li.unit_price * qty * 100)
+            : undefined;
+          items.push({ name, sku, qty, ...(amountMinor !== undefined ? { amount_minor: amountMinor } : {}) });
+        }
+      }
+    } catch {
+      // No items resolvable; the receipt still renders with the breakdown alone.
+    }
+  }
+
+  const merchant = {
+    name: typeof flags["merchant-name"] === "string" && flags["merchant-name"] !== ""
+      ? flags["merchant-name"]
+      : merchantNameFromHost(merchantHost),
+    host: merchantHost,
+    ...(typeof flags["merchant-location"] === "string" && flags["merchant-location"] !== ""
+      ? { location: flags["merchant-location"] }
+      : {}),
+  };
+  const orderUrl = typeof flags["order-url"] === "string" && flags["order-url"] !== ""
+    ? flags["order-url"]
+    : `${iss.replace(/\/$/, "")}/orders/${orderId}`;
+
+  // Fetch the server-recorded authorization trail (get_signatures), owner-scoped
+  // with the same payer-wallet fallback as the receipt: a platform-originated
+  // order is owned by an origin aid, not the buyer, so the buyer proves control of
+  // its payer wallet (over the DISTINCT signatures challenge) to read the trail.
+  // Best effort: the receipt still renders without it when the endpoint is absent.
+  let serverTrail: ServerTrail | null = null;
+  {
+    let sres = await fetchSignatures(base, orderId, buyKya);
+    if (sres.trail === null && sres.status === 403) {
+      const walletAuth = await walletSignaturesAuth(wallet.key, orderId);
+      sres = await fetchSignatures(base, orderId, buyKya, walletAuth);
+    }
+    serverTrail = sres.trail;
+  }
+
+  // Read the official template and fill it.
+  const templatePath = new URL("../references/receipt-template.html", import.meta.url);
+  let template = "";
+  try {
+    template = await Deno.readTextFile(templatePath);
+  } catch (e) {
+    die(`could not read the receipt template: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  const html = fillReceiptTemplate(template, {
+    jws,
+    pubkeyX,
+    merchant,
+    provenance,
+    orderUrl,
+    items,
+    ...(serverTrail !== null ? { serverTrail } : {}),
+  });
+
+  const out = typeof flags.out === "string" && flags.out !== ""
+    ? flags.out
+    : `${receiptsDir()}/${orderId}.html`;
+  try {
+    await Deno.writeTextFile(out, html);
+  } catch (e) {
+    die(`could not write the receipt HTML to ${out}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  emit({
+    ok: true,
+    order_id: orderId,
+    out,
+    merchant: merchant.name,
+    verified: verified.verified === true,
+    has_provenance: provenance !== null,
+    has_server_trail: serverTrail !== null,
+    pubkey_embedded: pubkeyX !== null,
+    message: `Rendered the official Facet receipt for order ${orderId} to ${out}` +
+      (provenance !== null ? " with the full provenance chain" : " (no provenance archived; a fresh `buy --settle` archives it)") +
+      ". Open it in a browser; the verify seal runs a live Ed25519 check.",
+  });
+}
+
 async function cmdReceipts(_flags: Record<string, string | boolean>): Promise<never> {
   const dir = receiptsDir();
   let raw = "";
@@ -3589,6 +4425,9 @@ if (import.meta.main) {
       case "buy":
         await cmdBuy(flags);
         break;
+      case "mpp-charge":
+        await cmdMppCharge(flags);
+        break;
       case "email-pref":
         // positional[2] is the address argument for `email-pref set <address>`.
         cmdEmailPref(sub, positional[2], flags);
@@ -3620,6 +4459,9 @@ if (import.meta.main) {
       case "receipt":
         await cmdReceipt(flags);
         break;
+      case "render-receipt":
+        await cmdRenderReceipt(flags);
+        break;
       case "receipts":
         await cmdReceipts(flags);
         break;
@@ -3629,8 +4471,9 @@ if (import.meta.main) {
       default:
         die(
           `unknown subcommand "${cmd}". Use: wallet new | wallets | fund | discover | directory | ` +
-            `search | product | provision | buy | email-pref | redeem | cancel | withdraw | dispute | ` +
-            `refund | resolve | reorder | revise | receipt | receipts | lifecycle-receipt.`,
+            `search | product | provision | buy | mpp-charge | email-pref | redeem | cancel | withdraw | ` +
+            `dispute | refund | resolve | reorder | revise | receipt | render-receipt | receipts | ` +
+            `lifecycle-receipt.`,
         );
     }
   } catch (e) {

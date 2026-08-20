@@ -1,4 +1,4 @@
-#!/usr/bin/env -S deno run --allow-env --allow-read --allow-run
+#!/usr/bin/env -S deno run --allow-env --allow-read --allow-run --allow-net
 // mcp-server.ts
 // A Model Context Protocol (MCP) server, stdio transport, that exposes the Facet
 // buyer shopping workflow as MCP tools so an AUTONOMOUS agent can discover,
@@ -6,26 +6,52 @@
 // designed to be walked by agents, not humans, so this is the agent-facing tool
 // surface, not a human CLI.
 //
-// This is a THIN wrapper. Every tool spawns one of the existing skill scripts
-// (facet-checkout.ts or browse-storefront.ts) as a child process and relays the
-// ONE JSON object that child prints to stdout. No checkout, wallet, or KYA logic
-// is reimplemented here: the child performs the offer validation, the local
-// signing, and the settlement exactly as the CLI does. The cmd* handlers in
-// facet-checkout.ts call Deno.exit and are not exported, so driving them as
-// subprocesses is the only way to reuse the real flow without reimplementing it.
+// This is a THIN wrapper, with ONE deliberate exception (stated below). Every
+// SPAWN tool runs one of the existing skill scripts (facet-checkout.ts or
+// browse-storefront.ts) as a child process and relays the ONE JSON object that
+// child prints to stdout. No checkout, wallet, or KYA logic is reimplemented for
+// those tools: the child performs the offer validation, the local signing, and
+// the settlement exactly as the CLI does. The cmd* handlers in facet-checkout.ts
+// call Deno.exit and are not exported, so driving them as subprocesses is the way
+// to reuse the real flow without reimplementing it.
 //
 // THE SECRET INVARIANT (the reason this file is careful):
-//   The wallet private key and the recovery mnemonic are read by the CHILD from
-//   its environment and used to sign locally. The child prints only non-secret
-//   JSON to stdout; the single place a secret is ever revealed is the one-time
-//   mnemonic that `wallet new` writes to the child's STDERR. This server runs
-//   every child with `stderr: "null"`, so that stream is discarded by the OS and
-//   never enters this process, and it builds every tool result solely from the
-//   child's STDOUT. A tool result therefore carries an address or a status,
-//   never a secret. An MCP result is logged and persisted by the calling agent,
-//   so stderr is held to the same bar the secret-egress rule holds stdout to: it
-//   never reaches a tool response. The server itself never reads a wallet key or
-//   mnemonic into a variable; the child inherits the environment directly.
+//   For a SPAWN tool, the wallet private key and the recovery mnemonic are read by
+//   the CHILD from its environment and used to sign locally. The child prints only
+//   non-secret JSON to stdout; the single place a secret is ever revealed is the
+//   one-time mnemonic that `wallet new` writes to the child's STDERR. This server
+//   runs every child with `stderr: "null"`, so that stream is discarded by the OS
+//   and never enters this process, and it builds every tool result solely from the
+//   child's STDOUT. A tool result therefore carries an address or a status, never a
+//   secret. An MCP result is logged and persisted by the calling agent, so stderr
+//   is held to the same bar the secret-egress rule holds stdout to: it never
+//   reaches a tool response. For a spawn tool the server itself never reads a
+//   wallet key or mnemonic into a variable; the child inherits the environment
+//   directly.
+//
+// THE EXCEPTION (per-line Boson escrow, IN-PROCESS):
+//   The per-line escrow tools (redeem / cancel / dispute over a SELECTION of
+//   exchange_ids, and the facet_lines reader) do NOT spawn. They run in-process and
+//   import the audited signing helpers from facet-checkout.ts (resolveWallet,
+//   signBosonAction, walletBoundKya, kyaHeaders, terminalBase, DISPUTE_ACTION_ID),
+//   and for those tools ONLY this server DOES read the wallet key into memory to
+//   sign locally. That is a deliberate departure from the spawn-to-sign isolation
+//   above, and it is necessary: a per-line action posts ONE request whose body is a
+//   SET of line items, each carrying its own locally signed payload, and the
+//   single-exchange CLI cannot assemble or post that set. The key is still held to
+//   the same bar: it signs locally, each signed payload is posted to the Terminal,
+//   and NEITHER the key NOR any raw signed payload is ever placed in a tool result.
+//   A per-line tool result is only the Terminal's own JSON, or a structured,
+//   secret-free error. Every OTHER tool still spawns the CLI unchanged.
+
+import {
+  DISPUTE_ACTION_ID,
+  kyaHeaders,
+  resolveWallet,
+  signBosonAction,
+  terminalBase,
+  walletBoundKya,
+} from "./facet-checkout.ts";
 
 // ---- paths and permission profiles -----------------------------------------
 
@@ -95,9 +121,17 @@ interface ToolDef {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
-  script: "facet-checkout.ts" | "browse-storefront.ts";
-  perms: () => string[];
-  build: (args: Args) => string[];
+  // A SPAWN tool defines script/perms/build: executeTool builds the child argv,
+  // runs the child, and relays its stdout JSON. These are optional so a run-only
+  // tool (the in-process per-line escrow tools) can omit them entirely.
+  script?: "facet-checkout.ts" | "browse-storefront.ts";
+  perms?: () => string[];
+  build?: (args: Args) => string[];
+  // An IN-PROCESS tool defines run. executeTool calls it BEFORE building/spawning:
+  // a non-null result is returned directly; a null result falls through to the
+  // spawn path, so one tool can serve a per-line SET in-process yet still spawn the
+  // single-item CLI when no set was given.
+  run?: (args: Args) => Promise<McpToolResult | null>;
 }
 
 function obj(
@@ -115,6 +149,200 @@ function obj(
 const S = { type: "string" } as const;
 const B = { type: "boolean" } as const;
 const N = { type: "number" } as const;
+
+// ---- per-line Boson escrow (in-process) ------------------------------------
+// The per-line escrow tools redeem / cancel / dispute a SELECTION of a committed
+// multi-line order's exchanges in ONE request: the Terminal accepts a set body
+// ({redeem,cancel,dispute}_line_items), each item carrying its own locally signed
+// payload. Assembling and posting that set is why these tools run in-process (see
+// THE EXCEPTION at the top of this file) rather than spawning the single-exchange
+// CLI. The validators below are pure (no wallet, no network, no secrets) so they
+// are unit-tested directly; the two runners hold the key with the same care the
+// spawn path does and return only the Terminal's JSON or a structured error.
+
+type PerLineKind = "redeem" | "cancel" | "dispute";
+
+// Accept a string[] OR a comma-separated string; trim, drop empties, and dedupe
+// preserving first-seen order. Pure.
+export function normalizeExchangeIds(raw: unknown): string[] {
+  let parts: string[];
+  if (Array.isArray(raw)) {
+    parts = raw.map((x) => (typeof x === "string" ? x : String(x)));
+  } else if (typeof raw === "string") {
+    parts = raw.split(",");
+  } else {
+    parts = [];
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const p of parts) {
+    const id = p.trim();
+    if (id === "" || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+// The Terminal set-body key for each per-line route. Pure.
+export function perLineBodyKey(kind: PerLineKind): string {
+  return kind === "redeem"
+    ? "redeem_line_items"
+    : kind === "cancel"
+    ? "cancel_line_items"
+    : "dispute_line_items";
+}
+
+// Validate the per-line arguments with no side effects: reject a single/set
+// collision (exchange_id together with exchange_ids), an empty set, a per-line
+// cancel that also asks to withdraw (withdraw is single-line only), and an invalid
+// dispute action; otherwise return the deduped exchange ids and, for dispute, the
+// validated action (default raise). Pure, so it is unit-tested directly.
+export function planPerLineEscrowAction(
+  kind: PerLineKind,
+  args: Args,
+): { ok: true; exchangeIds: string[]; action: string } | { ok: false; error: string } {
+  const hasSingle = typeof args.exchange_id === "string"
+    ? args.exchange_id !== ""
+    : args.exchange_id !== undefined && args.exchange_id !== null;
+  if (hasSingle) {
+    return {
+      ok: false,
+      error:
+        "exchange_id and exchange_ids are mutually exclusive: pass exchange_ids for a per-line set, or exchange_id for a single line.",
+    };
+  }
+  const exchangeIds = normalizeExchangeIds(args.exchange_ids);
+  if (exchangeIds.length === 0) {
+    return { ok: false, error: "exchange_ids is empty: pass at least one exchange id." };
+  }
+  if (kind === "cancel" && (args.withdraw === true || args.withdraw === "true")) {
+    return {
+      ok: false,
+      error:
+        "per-line cancel does not support withdraw: withdraw is single-line only. Cancel the lines, then cash each out with facet_withdraw, or use exchange_id with withdraw for a single line.",
+    };
+  }
+  let action = "";
+  if (kind === "dispute") {
+    action = typeof args.action === "string" ? args.action : "raise";
+    if (action !== "raise" && action !== "retract" && action !== "escalate") {
+      return {
+        ok: false,
+        error: `invalid dispute action "${action}": one of raise, retract, escalate.`,
+      };
+    }
+  }
+  return { ok: true, exchangeIds, action };
+}
+
+// Parse a single Terminal response body into a JSON object, or null when the body
+// is not a JSON object (an HTML 502, a scalar, an array).
+function parseObjectOrNull(text: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // not JSON
+  }
+  return null;
+}
+
+// Turn a Terminal response (already read to text) into a secret-free tool result,
+// mirroring the CLI lifecycle shapes: a dual-auth co-signature refusal on a 401/403
+// whose body mentions a signature, a non-JSON body, or the Terminal's own JSON
+// relayed with its ok flag. `label` names the action for the no-JSON message.
+function terminalResponseResult(
+  status: number,
+  ok: boolean,
+  text: string,
+  label: string,
+): McpToolResult {
+  if ((status === 401 || status === 403) && /signature/i.test(text)) {
+    return textResult(
+      {
+        ok: false,
+        error:
+          "this store requires a platform co-signature for this action; a buyer-only client cannot supply it.",
+        reason: "platform_cosignature_required",
+        http_status: status,
+      },
+      true,
+    );
+  }
+  const json = parseObjectOrNull(text);
+  if (json === null) {
+    return textResult(
+      { ok: false, error: `${label} returned no JSON object (HTTP ${status}).`, http_status: status },
+      true,
+    );
+  }
+  return textResult(json, !ok || json.ok === false);
+}
+
+// redeem / cancel / dispute a SELECTION of a committed order's lines in one
+// request. Signs each line's payload locally with the buyer wallet key (read
+// in-process, per THE EXCEPTION), assembles the set body, posts it on the buyer
+// KYA, and returns ONLY the Terminal's JSON or a structured, secret-free error. The
+// key and the raw signed payloads never enter the result.
+async function runPerLineEscrowAction(kind: PerLineKind, args: Args): Promise<McpToolResult> {
+  try {
+    const plan = planPerLineEscrowAction(kind, args);
+    if (!plan.ok) return textResult({ ok: false, error: plan.error }, true);
+
+    const base = terminalBase(requireArg(args, "terminal"));
+    const wallet = resolveWallet(typeof args.wallet === "string" ? args.wallet : undefined);
+    const kya = await walletBoundKya(wallet);
+
+    const actionId = kind === "redeem"
+      ? "boson-redeem"
+      : kind === "cancel"
+      ? "boson-cancelVoucher"
+      : DISPUTE_ACTION_ID[plan.action];
+
+    const items: Array<Record<string, unknown>> = [];
+    for (const exchangeId of plan.exchangeIds) {
+      const signed_payload = await signBosonAction(wallet.key, actionId, exchangeId);
+      items.push(
+        kind === "dispute"
+          ? { exchange_id: exchangeId, action: plan.action, signed_payload }
+          : { exchange_id: exchangeId, signed_payload },
+      );
+    }
+
+    const response = await fetch(`${base}/ucp/v1/checkout-sessions/${kind}`, {
+      method: "POST",
+      headers: kyaHeaders(kya),
+      body: JSON.stringify({ [perLineBodyKey(kind)]: items }),
+    });
+    const text = await response.text();
+    return terminalResponseResult(response.status, response.ok, text, `the ${kind} set request`);
+  } catch (e) {
+    return textResult({ ok: false, error: e instanceof Error ? e.message : String(e) }, true);
+  }
+}
+
+// Read a committed per-line order's current escrow_lines (each line's own
+// exchange_id, amount, currency, and state) so the agent can choose which lines to
+// redeem / cancel / dispute. Owner-scoped at the Terminal on the buyer KYA. Returns
+// only the session JSON or a structured, secret-free error.
+async function runLinesRead(args: Args): Promise<McpToolResult> {
+  try {
+    const base = terminalBase(requireArg(args, "terminal"));
+    const orderId = requireArg(args, "order_id");
+    const wallet = resolveWallet(typeof args.wallet === "string" ? args.wallet : undefined);
+    const kya = await walletBoundKya(wallet);
+    const response = await fetch(`${base}/ucp/v1/checkout-sessions/${orderId}`, {
+      headers: kyaHeaders(kya),
+    });
+    const text = await response.text();
+    return terminalResponseResult(response.status, response.ok, text, "the lines read");
+  } catch (e) {
+    return textResult({ ok: false, error: e instanceof Error ? e.message : String(e) }, true);
+  }
+}
 
 export const TOOLS: ToolDef[] = [
   {
@@ -325,6 +553,43 @@ export const TOOLS: ToolDef[] = [
     },
   },
   {
+    name: "facet_mpp_charge",
+    description: "Pay a held reservation through the Machine Payments Protocol (mpp.dev) charge " +
+      "envelope, for an mpp.dev-native flow. MPP is not a separate rail: it is the same on-chain " +
+      "settlement re-dressed in mpp.dev's challenge/credential/receipt shape. Reserve first (call " +
+      "facet_buy in DRY mode and use its checkout_id, or POST /v1/reserve) and pass that as " +
+      "reservation_id. DRY by default: it probes the charge endpoint, reads the server-derived " +
+      "challenge (amount, recipient, currency, chain), validates it against the buyer guardrails, " +
+      "and stops, returning confirm_atomic and confirm_pay_to. Nothing moves. To settle real USDC, " +
+      "call again with settle true, confirm set to the exact atomic amount the dry run returned, and " +
+      "confirm_pay_to set to the recipient it returned, only after the user approved that total. The " +
+      "credential is signed locally and the wallet key never leaves the child process. MPP settles " +
+      "x402-direct with no escrow, so it REFUSES on any merchant that offers Boson escrow (it reads the " +
+      "reservation's rails first) and points you to facet_buy instead: MPP never bypasses escrow.",
+    inputSchema: obj({
+      terminal: S,
+      reservation_id: S,
+      wallet: S,
+      settle: B,
+      confirm: S,
+      confirm_pay_to: S,
+      max_usdc: N,
+    }, ["terminal", "reservation_id"]),
+    script: "facet-checkout.ts",
+    perms: facetPerms,
+    build: (a) => {
+      const v = ["mpp-charge"];
+      pushStr(v, "terminal", requireArg(a, "terminal"));
+      pushStr(v, "reservation-id", requireArg(a, "reservation_id"));
+      pushStr(v, "wallet", a.wallet);
+      pushBool(v, "settle", a.settle);
+      pushStr(v, "confirm", a.confirm);
+      pushStr(v, "confirm-pay-to", a.confirm_pay_to);
+      pushStr(v, "max-usdc", a.max_usdc);
+      return v;
+    },
+  },
+  {
     name: "facet_email_pref",
     description: "Record or read the buyer's throwaway shipping-confirmation email, asked once " +
       "and reused on every later order so the agent never asks twice. action show prints the " +
@@ -373,13 +638,25 @@ export const TOOLS: ToolDef[] = [
     name: "facet_redeem",
     description: "Redeem a settled Boson escrow order: confirm the goods arrived and release the " +
       "escrow to the seller. Signed locally and gasless with the buyer's own wallet. " +
-      "exchange_id is the settlement_id the buy receipt returned.",
-    inputSchema: obj({ terminal: S, exchange_id: S, wallet: S }, [
-      "terminal",
-      "exchange_id",
-    ]),
+      "exchange_id is the settlement_id the buy receipt returned. For a committed per-line " +
+      "(multi-item) order, pass exchange_ids (a string array, or a comma-separated string) " +
+      "instead to redeem a SELECTION of lines at once: each line is signed locally and posted " +
+      "as one set, and the result summarizes it with a top-level status plus counts and a " +
+      "per-line lines[] array. Pass exactly one of exchange_id or exchange_ids; read the lines " +
+      "first with facet_lines.",
+    inputSchema: obj({
+      terminal: S,
+      exchange_id: S,
+      exchange_ids: { type: "array", items: { type: "string" } },
+      wallet: S,
+    }, ["terminal"]),
     script: "facet-checkout.ts",
     perms: facetPerms,
+    run: (a) =>
+      (Array.isArray(a.exchange_ids) && a.exchange_ids.length > 0) ||
+        (typeof a.exchange_ids === "string" && a.exchange_ids !== "")
+        ? runPerLineEscrowAction("redeem", a)
+        : Promise.resolve(null),
     build: (a) => {
       const v = ["redeem"];
       pushStr(v, "terminal", requireArg(a, "terminal"));
@@ -395,13 +672,27 @@ export const TOOLS: ToolDef[] = [
       "own wallet. exchange_id is the settlement_id the buy receipt returned. Set " +
       "withdraw true to also cash the returned escrow out to the buyer's own wallet in " +
       "the same call (cancel, then a gasless withdraw); amount optionally overrides the " +
-      "withdrawn atomic amount (default: the full available balance).",
-    inputSchema: obj({ terminal: S, exchange_id: S, wallet: S, withdraw: B, amount: S }, [
-      "terminal",
-      "exchange_id",
-    ]),
+      "withdrawn atomic amount (default: the full available balance). For a committed " +
+      "per-line (multi-item) order, pass exchange_ids (a string array, or a comma-separated " +
+      "string) instead to cancel a SELECTION of lines at once: each line is signed locally " +
+      "and posted as one set, and the result summarizes it with a top-level status plus counts " +
+      "and a per-line lines[] array. Pass exactly one of exchange_id or exchange_ids; withdraw " +
+      "is single-line only, so it cannot be combined with exchange_ids.",
+    inputSchema: obj({
+      terminal: S,
+      exchange_id: S,
+      exchange_ids: { type: "array", items: { type: "string" } },
+      wallet: S,
+      withdraw: B,
+      amount: S,
+    }, ["terminal"]),
     script: "facet-checkout.ts",
     perms: facetPerms,
+    run: (a) =>
+      (Array.isArray(a.exchange_ids) && a.exchange_ids.length > 0) ||
+        (typeof a.exchange_ids === "string" && a.exchange_ids !== "")
+        ? runPerLineEscrowAction("cancel", a)
+        : Promise.resolve(null),
     build: (a) => {
       const v = ["cancel"];
       pushStr(v, "terminal", requireArg(a, "terminal"));
@@ -444,15 +735,26 @@ export const TOOLS: ToolDef[] = [
     description: "Raise, retract, or escalate a dispute on a Boson escrow order. Signed locally " +
       "and gasless with the buyer's own wallet. action is one of raise, retract, " +
       "escalate (default raise). To complete a partial-refund split, use facet_resolve: " +
-      "it carries the seller's counter-signature.",
+      "it carries the seller's counter-signature. For a committed per-line (multi-item) order, " +
+      "pass exchange_ids (a string array, or a comma-separated string) instead to apply the " +
+      "same action to a SELECTION of lines at once: each line is signed locally and posted as " +
+      "one set, and the result summarizes it with a top-level status plus counts and a per-line " +
+      "lines[] array. Pass exactly one of exchange_id or exchange_ids; read the lines first with " +
+      "facet_lines.",
     inputSchema: obj({
       terminal: S,
       exchange_id: S,
+      exchange_ids: { type: "array", items: { type: "string" } },
       action: { type: "string", enum: ["raise", "retract", "escalate"] },
       wallet: S,
-    }, ["terminal", "exchange_id"]),
+    }, ["terminal"]),
     script: "facet-checkout.ts",
     perms: facetPerms,
+    run: (a) =>
+      (Array.isArray(a.exchange_ids) && a.exchange_ids.length > 0) ||
+        (typeof a.exchange_ids === "string" && a.exchange_ids !== "")
+        ? runPerLineEscrowAction("dispute", a)
+        : Promise.resolve(null),
     build: (a) => {
       const v = ["dispute"];
       pushStr(v, "terminal", requireArg(a, "terminal"));
@@ -461,6 +763,18 @@ export const TOOLS: ToolDef[] = [
       pushStr(v, "wallet", a.wallet);
       return v;
     },
+  },
+  {
+    name: "facet_lines",
+    description: "Read a committed per-line (multi-item) Boson order's current escrow lines so the " +
+      "agent can choose which lines to act on. Returns the order's escrow_lines: each line's own " +
+      "line_index, exchange_id, amount, currency, and exchange_state (plus status), owner-scoped " +
+      "to the caller's wallet-bound identity. Runs in-process on the buyer KYA and reads only; it " +
+      "moves no money and returns no key. Use it before facet_redeem, facet_cancel, or " +
+      "facet_dispute with exchange_ids to target specific lines. order_id is the order id the buy " +
+      "receipt returned.",
+    inputSchema: obj({ terminal: S, order_id: S, wallet: S }, ["terminal", "order_id"]),
+    run: (a) => runLinesRead(a),
   },
   {
     name: "facet_refund",
@@ -601,6 +915,41 @@ export const TOOLS: ToolDef[] = [
     },
   },
   {
+    name: "facet_render_receipt",
+    description: "Render a settled order's receipt into the OFFICIAL, self-contained, self-verifying " +
+      "HTML page (the one canonical Facet receipt view). Every field is derived in the page from the " +
+      "embedded signed JWS, the merchant's Ed25519 public key is embedded so the verify seal is a real " +
+      "in-browser check, and the identity, payment, and verification provenance chain renders when it is " +
+      "available (from the archive a settled buy wrote, or an explicit provenance_file). Writes the HTML " +
+      "and returns its path; nothing on the receipt is secret, so the file is shareable. order_id is the " +
+      "order id the buy receipt returned; merchant_name is an optional display name; out is an optional " +
+      "output path (defaults under the receipts archive).",
+    inputSchema: obj({
+      terminal: S,
+      order_id: S,
+      wallet: S,
+      merchant_name: S,
+      merchant_location: S,
+      order_url: S,
+      provenance_file: S,
+      out: S,
+    }, ["terminal", "order_id"]),
+    script: "facet-checkout.ts",
+    perms: facetPerms,
+    build: (a) => {
+      const v = ["render-receipt"];
+      pushStr(v, "terminal", requireArg(a, "terminal"));
+      pushStr(v, "order-id", requireArg(a, "order_id"));
+      pushStr(v, "wallet", a.wallet);
+      pushStr(v, "merchant-name", a.merchant_name);
+      pushStr(v, "merchant-location", a.merchant_location);
+      pushStr(v, "order-url", a.order_url);
+      pushStr(v, "provenance-file", a.provenance_file);
+      pushStr(v, "out", a.out);
+      return v;
+    },
+  },
+  {
     name: "facet_lifecycle_receipt",
     description: "Fetch, verify, and archive the signed REVERSAL receipt for a cancel, withdraw, " +
       "dispute, or refund (the lifecycle analogue of facet_get_receipt). A compact Ed25519 JWS " +
@@ -703,6 +1052,23 @@ export async function executeTool(name: string, args: Args): Promise<McpToolResu
   const tool = TOOLS.find((t) => t.name === name);
   if (tool === undefined) {
     return textResult({ ok: false, error: `unknown tool: ${name}` }, true);
+  }
+  // In-process path first. A run-only tool (facet_lines) always answers here; a
+  // dual-mode tool (redeem / cancel / dispute) answers here only for a per-line
+  // SET and returns null for the single-exchange case, which falls through to the
+  // spawn path below. The runners self-wrap every failure into a structured result.
+  if (tool.run !== undefined) {
+    const r = await tool.run(args ?? {});
+    if (r !== null) return r;
+  }
+  // Spawn path. A run-only tool that returned null has no CLI fallback: that is a
+  // bug, not a valid state, so report it structurally rather than dereferencing an
+  // absent build/script/perms.
+  if (tool.build === undefined || tool.script === undefined || tool.perms === undefined) {
+    return textResult(
+      { ok: false, error: `tool ${name} has no spawn path and its in-process run returned null.` },
+      true,
+    );
   }
   let sub: string[];
   try {

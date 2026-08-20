@@ -4,6 +4,98 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-08-20
+
+### Added
+
+- Per-line Boson escrow over MCP. New in-process MCP tools redeem, cancel, and dispute a
+  SELECTION of a Boson order's line items in one request, each line carrying its own
+  locally-signed payload, plus a `facet_lines` reader that lists an order's per-line
+  escrow states. Unlike the other MCP tools, which spawn the CLI to sign in isolation,
+  these run in-process and import the audited signing helpers, because a per-line action
+  posts one request whose body is a set of signed line payloads the single-exchange CLI
+  cannot assemble. The wallet key still signs locally, and neither the key nor any signed
+  payload ever appears in a tool result.
+- Server-recorded authorization trail in the receipt. `render-receipt` now reads the
+  Terminal's owner-scoped `get_signatures` endpoint at render time and shows, inside the
+  proof reveal, every credential the Terminal verified across the purchase: the KYA by
+  hash, the UCP RFC 9421 platform signature, the ERC-3009 payment authorization, the
+  seller offer, and a count of Facet's own Ed25519 response signatures and counterparty
+  attestations. Owner-scoped exactly like the receipt, with the same payer-wallet
+  fallback (over a distinct signatures challenge) so a platform-originated order the
+  buyer paid for still reads its trail. Best effort: the receipt renders without the
+  trail when the endpoint is unavailable, and the KYA is never returned in cleartext.
+- Official receipt template and renderer. `render-receipt --terminal <url> --order-id <id>`
+  (and the `facet_render_receipt` MCP tool) fetch and verify a settled order's receipt,
+  embed the merchant's Ed25519 public key, and fill the canonical template at
+  `references/receipt-template.html`, writing a self-contained, self-verifying HTML page:
+  the verify seal runs a real in-browser Ed25519 check, every field derives from the
+  embedded signed JWS, and the identity, payment, and verification provenance chain
+  renders when available. The template is a dark, signed-ledger design (with a light
+  toggle) that pairs the order's line items with the money breakdown (goods, tax,
+  shipping, duty, discount): each item shows its name, SKU, and quantity. Items are read
+  from the buyer's `order_history` (each SKU's display name from `get_product`), or
+  supplied explicitly with `--items-file <path>` (a JSON array of `{ name, sku, qty,
+  amount_minor? }`) for an order the buyer's identity does not own, such as a
+  platform-originated order; without either, the receipt renders the money breakdown
+  alone. Provenance comes from the archive a `buy --settle` now writes alongside the
+  receipt (`saveReceipt` stores it) or an explicit `--provenance-file`; optional
+  `--merchant-name` / `--merchant-location` / `--order-url` set the masthead and order
+  link. New pure helpers `fillReceiptTemplate`, `pubkeyXForKid`, and
+  `merchantNameFromHost` in `scripts/render-receipt.ts`, each with offline tests. This
+  replaces the hand-rolled, one-off receipt pages with a single canonical rendering for
+  all receipts.
+- Client-side provenance on every settled purchase. `buy` (both rails) and `mpp-charge`
+  now return a `provenance` block recording the signature chain the client presented and
+  received: the buyer KYA's identity claims (aid / issuer / expiry, decoded from the token,
+  never the raw bearer); the payment leg (on Boson, the buyer's ERC-3009 token
+  authorization plus the seller's offer signature, extracted from the commit rather than
+  the raw multi-KB blob; on x402/MPP, the ERC-3009 authorization and signature); the
+  settlement chain (checkout, order, settlement id); and the Terminal's Ed25519-signed
+  receipt with whether it verified offline against the merchant JWKS. New pure helpers
+  `kyaIdentity`, `buildProvenance`, and `decodeBosonCommit`, each with offline tests. The
+  block deliberately notes what it cannot include, the platform's `ucp_platform_rfc9421`
+  co-signature, which the Terminal records server-side in its own FORCE-RLS-locked
+  signatures ledger with no buyer-facing endpoint.
+- Machine Payments Protocol (mpp.dev) support: a new `mpp-charge` subcommand (and
+  `facet_mpp_charge` MCP tool) that pays a held reservation through mpp.dev's charge
+  envelope, for an mpp.dev-native flow. MPP is not a separate rail: it is the same
+  on-chain x402 settlement re-dressed in mpp.dev's challenge / credential / receipt
+  shape. Reserve first with a DRY `buy` (its `checkout_id` is a valid reservation id),
+  then `mpp-charge --reservation-id <id>` probes the charge endpoint for the 402
+  challenge (amount, recipient, currency and chain all server-derived, never client-set),
+  verifies it against a new pure `assertMppTerms` guardrail (chain, USDC, per-checkout
+  cap, and a `--confirm-pay-to` recipient bind), and stops. `--settle` requires an exact
+  `--confirm` of the amount AND `--confirm-pay-to` of the recipient (the MPP recipient is
+  the merchant's own server-derived payout, not escrow-pinned, so it is confirmed like
+  the x402-direct recipient); mppx then builds the evm/charge credential (an ERC-3009
+  authorization whose nonce is bound to the challenge), the wallet signs it locally, and
+  it is resubmitted. No KYA rides the charge leg (the unguessable reservation id is the
+  capability and the credential moves the signer's own funds). `discover` now also
+  surfaces a host's `mpp_endpoint` / `mpp_method` / `mpp_auth` when it serves MPP.
+  Because MPP settles x402-direct with no escrow, `mpp-charge` never bypasses escrow:
+  before charging it reads the reservation's own checkout session and refuses
+  (`escrow_available_mpp_refused`, pure `mppRefusedForEscrow`) if the merchant offers
+  Boson escrow, sending the caller to `buy`; it fails closed if it cannot confirm the
+  merchant is x402-only. MPP has no refund leg of its own (an MPP charge is an
+  x402-direct order), so the settle result surfaces `order_id` and a `refund` hint:
+  a refund runs through the standard `refund --order-id` request and the merchant's
+  x402-direct send-back. Facet custodies neither funds nor keys.
+
+### Changed
+
+- Receipt template surface trimmed to what a person reads at a glance: the amount and
+  order breakdown, the live verify stamp, and the tamper-evident ledger. The settlement
+  metadata, the signing details, the buyer identity and payment authorization provenance,
+  and the compact signed JWS now live inside the collapsible proof reveal, opened on
+  demand. Token-only move (the renderer is unchanged); the reveal body is a plain
+  container so each tucked section pads itself like the surface sections.
+- Refund flow docs corrected: a merchant approve of a still-committed Boson escrow now
+  RELEASES the escrow via a seller revoke (the whole escrow returns to the buyer, then
+  `withdraw`), with no buyer `resolve` step. `resolve` is only for a disputed post-redeem
+  partial (a `resolveDispute` split). The earlier wording implied every Boson refund
+  needed a `resolve`.
+
 ## [1.1.0] - 2026-08-18
 
 ### Added

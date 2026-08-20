@@ -18,7 +18,12 @@ import {
 } from "npm:viem@2.50.4";
 import {
   assertDisplayScalarsSane,
+  assertMppTerms,
   assertOfferMatches,
+  buildProvenance,
+  decodeBosonCommit,
+  kyaIdentity,
+  mppRefusedForEscrow,
   assertX402Terms,
   b64urlToJson,
   buildRefundBody,
@@ -227,6 +232,194 @@ Deno.test("x402 non-canonical amount is refused (scientific, hex, fractional, wh
 
 Deno.test("x402 empty amount is refused", () => {
   assertThrows(() => assertX402Terms({ ...x402Adv(), amountAtomic: "" }, x402Expect()), Error, "not a positive number");
+});
+
+// ---- assertMppTerms: the MPP (mpp.dev) charge guardrail choke point ----------
+// The MPP sibling of assertX402Terms, run on the terms the Terminal put in the 402
+// challenge BEFORE mppx builds the evm/charge credential and the wallet signs it.
+// MPP is the x402 settlement leg in mpp.dev's envelope: no escrow, the recipient is
+// the merchant's own server-derived payout, so the guard validates chain, currency
+// and the amount cap, and (on settle) binds the recipient to --confirm-pay-to.
+const MPP_RECIPIENT = "0x2222222222222222222222222222222222222222";
+function mppChal() {
+  return { recipient: MPP_RECIPIENT, amountAtomic: "5000000", currency: USDC, chainId: 8453 };
+}
+function mppExpect() {
+  return { chainId: 8453, usdc: USDC, capAtomic: 25_000_000, capUsdc: 25 };
+}
+
+Deno.test("MPP honest terms pass and return the atomic price", () => {
+  assertEquals(assertMppTerms(mppChal(), mppExpect()), 5_000_000);
+});
+
+Deno.test("MPP terms pass with a lowercased currency (case-insensitive match)", () => {
+  assertEquals(assertMppTerms({ ...mppChal(), currency: USDC.toLowerCase() }, mppExpect()), 5_000_000);
+});
+
+Deno.test("MPP malformed recipient is refused (no valid recipient)", () => {
+  assertThrows(() => assertMppTerms({ ...mppChal(), recipient: "" }, mppExpect()), Error, "no valid recipient");
+  assertThrows(() => assertMppTerms({ ...mppChal(), recipient: "0x123" }, mppExpect()), Error, "no valid recipient");
+});
+
+Deno.test("MPP wrong chain is refused", () => {
+  assertThrows(() => assertMppTerms({ ...mppChal(), chainId: 84532 }, mppExpect()), Error, "expected 8453");
+});
+
+Deno.test("MPP swapped currency (not USDC) is refused", () => {
+  const chal = { ...mppChal(), currency: "0x0000000000000000000000000000000000000001" };
+  assertThrows(() => assertMppTerms(chal, mppExpect()), Error, "not the expected USDC token");
+});
+
+Deno.test("CRITICAL: MPP amount over the cap is refused", () => {
+  assertThrows(() => assertMppTerms({ ...mppChal(), amountAtomic: "30000000" }, mppExpect()), Error, "exceeds");
+});
+
+Deno.test("MPP non-canonical amount is refused (scientific, hex, fractional, whitespace, sign, zero)", () => {
+  for (const bad of ["5e6", "0x4c4b40", "5.5", " 5000000 ", "+5000000", "0"]) {
+    assertThrows(
+      () => assertMppTerms({ ...mppChal(), amountAtomic: bad }, mppExpect()),
+      Error,
+      "not a positive integer",
+    );
+  }
+});
+
+Deno.test("MPP empty amount is refused", () => {
+  assertThrows(() => assertMppTerms({ ...mppChal(), amountAtomic: "" }, mppExpect()), Error, "not a positive integer");
+});
+
+Deno.test("CRITICAL: MPP recipient mismatch against --confirm-pay-to is refused (swap-at-settle)", () => {
+  // On settle the caller pins the recipient it saw at DRY. A Terminal that returned
+  // an honest recipient at DRY and a different one at settle is caught here.
+  const expectWithConfirm = { ...mppExpect(), confirmPayTo: "0x3333333333333333333333333333333333333333" };
+  assertThrows(() => assertMppTerms(mppChal(), expectWithConfirm), Error, "does not match the confirmed");
+});
+
+Deno.test("MPP recipient matches --confirm-pay-to (case-insensitive) passes", () => {
+  // The confirmed recipient is the challenge recipient in a different case; the
+  // guard lowercases both, so it must pass and return the price.
+  const expectWithConfirm = { ...mppExpect(), confirmPayTo: MPP_RECIPIENT.toUpperCase().replace("0X", "0x") };
+  assertEquals(assertMppTerms(mppChal(), expectWithConfirm), 5_000_000);
+});
+
+// ---- mppRefusedForEscrow: no bypassing escrow ------------------------------
+// MPP settles x402-direct (no escrow). If the reservation's merchant advertises the
+// Boson escrow handler, an MPP charge must be refused so it cannot stand in for an
+// escrow checkout. The signal is the merchant's advertised payment_handlers.
+const BOSON_HANDLER = "llc.facet.boson_escrow";
+const X402_HANDLER = "llc.facet.x402";
+
+Deno.test("CRITICAL: MPP is refused when the merchant advertises Boson escrow", () => {
+  // A Boson-default store (e.g. Pecan & Petal) advertises the escrow handler; MPP
+  // would bypass it, so the guard refuses.
+  assertEquals(mppRefusedForEscrow({ [BOSON_HANDLER]: [{}], [X402_HANDLER]: [{}] }), true);
+  assertEquals(mppRefusedForEscrow({ [BOSON_HANDLER]: [{}] }), true);
+});
+
+Deno.test("MPP is allowed on an x402-only merchant (no escrow to bypass)", () => {
+  assertEquals(mppRefusedForEscrow({ [X402_HANDLER]: [{}] }), false);
+});
+
+Deno.test("mppRefusedForEscrow treats no handlers as x402-only (allow)", () => {
+  // An empty or absent handler map means no Boson escrow is advertised, so there is
+  // no escrow to bypass. The live guard still fails closed on a session it cannot
+  // READ (HTTP != 200); this predicate only classifies a session it DID read.
+  assertEquals(mppRefusedForEscrow({}), false);
+  assertEquals(mppRefusedForEscrow(undefined), false);
+});
+
+// ---- kyaIdentity + buildProvenance: the client-side provenance record ---------
+// A synthetic KYA (a JWT: header.payload.signature) whose payload carries the
+// identity claims. Only the payload segment is read; the signature is ignored.
+function fakeKya(claims: Record<string, unknown>): string {
+  const b64url = (s: string) => btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return `${b64url('{"alg":"ES256"}')}.${b64url(JSON.stringify(claims))}.sig`;
+}
+
+Deno.test("kyaIdentity decodes aid/issuer/expiry from a KYA and never returns the token", () => {
+  const kya = fakeKya({ aid: "agent:abc", iss: "https://issuer.facet.llc", exp: 9999999999, sub: "x" });
+  assertEquals(kyaIdentity(kya), {
+    aid: "agent:abc",
+    issuer: "https://issuer.facet.llc",
+    expires: 9999999999,
+  });
+});
+
+Deno.test("kyaIdentity returns null for a non-JWT, empty, or undefined token", () => {
+  assertEquals(kyaIdentity("not-a-jwt"), null);
+  assertEquals(kyaIdentity(""), null);
+  assertEquals(kyaIdentity(undefined), null);
+});
+
+Deno.test("kyaIdentity tolerates missing claims (nulls, not a throw)", () => {
+  assertEquals(kyaIdentity(fakeKya({ foo: "bar" })), { aid: null, issuer: null, expires: null });
+});
+
+Deno.test("buildProvenance assembles identity, payment, settlement, and a verified response", () => {
+  const kya = fakeKya({ aid: "agent:xyz", iss: "https://issuer.facet.llc", exp: 123 });
+  const prov = buildProvenance({
+    rail: "boson",
+    kya,
+    payment: { commit_authorization: "0xdeadbeef", escrow: ESCROW },
+    checkoutId: "chk_1",
+    orderId: "ord_1",
+    settlementId: "set_1",
+    receipt: { jws: "a.b.c", kid: "key1", provider_jwks: "https://m.facet.llc/.well-known/jwks.json", verified: true },
+  }) as Record<string, Record<string, unknown>>;
+  assertEquals(prov.identity, { aid: "agent:xyz", issuer: "https://issuer.facet.llc", expires: 123 });
+  assertEquals(prov.payment.rail, "boson");
+  assertEquals(prov.payment.commit_authorization, "0xdeadbeef");
+  assertEquals(prov.settlement, { checkout_id: "chk_1", order_id: "ord_1", settlement_id: "set_1" });
+  assertEquals(prov.response.signed_receipt, true);
+  assertEquals(prov.response.verified, true);
+  assertEquals(prov.response.kid, "key1");
+  assert(typeof prov.note === "string" && (prov.note as unknown as string).includes("RFC 9421"));
+});
+
+Deno.test("buildProvenance verified is tri-state: null when the receipt was not verified inline", () => {
+  // x402 path: the receipt entry is present (signed) but not verified inline, so
+  // verified is null, not false, and the buyer can still verify it with `receipt`.
+  const unverified = buildProvenance({
+    rail: "x402",
+    payment: { signature: "0xsig" },
+    receipt: { jws: "a.b.c", kid: "k" },
+  }) as Record<string, Record<string, unknown>>;
+  assertEquals(unverified.response.signed_receipt, true);
+  assertEquals(unverified.response.verified, null);
+
+  // No receipt at all (e.g. MPP, or a deferred rail): signed_receipt false, verified null.
+  const none = buildProvenance({ rail: "mpp", payment: {}, receipt: null }) as Record<
+    string,
+    Record<string, unknown>
+  >;
+  assertEquals(none.response.signed_receipt, false);
+  assertEquals(none.response.verified, null);
+  assertEquals(none.identity, null);
+});
+
+Deno.test("decodeBosonCommit extracts the buyer ERC-3009 auth and the seller signature", () => {
+  const commit = btoa(JSON.stringify({
+    x402Version: 2,
+    scheme: "escrow",
+    network: "eip155:84532",
+    payload: {
+      action: "boson-createOfferAndCommit",
+      offerRef: { sellerSig: "0xseller123" },
+      tokenAuth: {
+        kind: "erc3009",
+        data: { from: "0xbuyer", to: "0xescrow", value: "12250000", nonce: "0xnonce", v: 27, r: "0xr", s: "0xs" },
+      },
+    },
+  }));
+  assertEquals(decodeBosonCommit(commit), {
+    token_authorization: { from: "0xbuyer", to: "0xescrow", value: "12250000", nonce: "0xnonce" },
+    buyer_signature: { v: 27, r: "0xr", s: "0xs" },
+    seller_signature: "0xseller123",
+  });
+});
+
+Deno.test("decodeBosonCommit returns null on an undecodable blob", () => {
+  assertEquals(decodeBosonCommit("not base64 json !!!"), null);
 });
 
 // ---- forcedRailIdFor: FACET_RAIL -> explicit rail_id -----------------------
@@ -824,7 +1017,7 @@ Deno.test("withdraw EIP-712: the digest changes when any signed field changes (n
   assert(h({ ...base, nonce: 43n }) !== baseHash, "nonce is not bound");
   assert(h({ ...base, amount: 1_000_001n }) !== baseHash, "amount is not bound");
   assert(h({ ...base, entityId: 18n }) !== baseHash, "entityId is not bound");
-  assert(h({ ...base, chainId: 1 }) !== baseHash, "chain (salt) is not bound");
+  assert(h({ ...base, chainId: 84532 }) !== baseHash, "chain (salt) is not bound");
 });
 
 // ---------------------------------------------------------------------------
