@@ -79,52 +79,33 @@ checkout. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Quick start
 
-Requirements: [Deno](https://deno.com) (the helper runtime). The two dependencies,
-a wallet signer and the escrow client, are pulled on first run and locked in
+Requirements: [Deno](https://deno.com) (the runtime). The two dependencies, a
+wallet signer and the escrow client, are pulled on first run and locked in
 `deno.lock`.
 
-Provide two values through the environment. Never pass either on a command line.
+The skill is driven over MCP, and MCP is the only interface. Point your agent's
+MCP client at the stdio server:
+
+```bash
+deno run --allow-env --allow-read --allow-run --allow-net \
+  --allow-write="$HOME/.cache,$HOME/.facet" scripts/mcp-server.ts
+```
+
+Provide the wallet through the environment (never on a command line); the server
+reads it and the key stays inside the process:
 
 ```bash
 export FACET_WALLET_KEY=0x...        # your wallet private key (0x + 64 hex); signs locally
 export FACET_KYA=...                 # optional; a wallet-bound KYA is self-issued if absent
 ```
 
-No wallet yet? Mint a self-custodied one first (the recovery phrase is shown once,
-on stderr, and never written to stdout or disk), then skip `FACET_WALLET_KEY`:
-
-```bash
-deno run --allow-env --allow-read --allow-write="$HOME/.cache,$HOME/.facet" --allow-run --allow-net \
-  scripts/facet-checkout.ts wallet new
-```
-
-List the wallets the assistant may shop from:
-
-```bash
-deno run --allow-env --allow-read --allow-write="$HOME/.cache" --allow-net \
-  scripts/facet-checkout.ts wallets
-```
-
-Check whether a store is agent-ready:
-
-```bash
-deno run --allow-env --allow-read --allow-net \
-  scripts/facet-checkout.ts discover --site store.example.com
-```
-
-Price a cart without moving money (DRY is the default; nothing settles):
-
-```bash
-deno run --allow-env --allow-read --allow-write="$HOME/.cache" --allow-net \
-  scripts/facet-checkout.ts buy \
-  --terminal https://store.example.com \
-  --items '[{"id":"SKU-1","qty":1}]' \
-  --ship '{"recipient":"Jane Doe","line1":"123 Main St","locality":"Austin","region":"TX","postal_code":"78701","country":"US"}'
-```
-
-Settlement requires a second, explicit run with `--settle --confirm <atomic>`,
-where the confirm value must equal the price the DRY run just advertised. See
-[`SKILL.md`](SKILL.md) for the operator flow the assistant follows.
+The agent then works entirely through the `facet_*` tools the server exposes:
+`facet_wallet_new` (mint a self-custodied wallet; the recovery phrase is shown once
+on the child's stderr, never in a tool result), `facet_wallet_list`,
+`facet_discover` (is a store agent-ready), `facet_buy` (dry by default; nothing
+settles until a second call with `settle: true` and the exact confirmed price), and
+the full post-purchase lifecycle. See [`SKILL.md`](SKILL.md) for the flow the agent
+follows and the complete tool reference.
 
 ## A reference implementation, not the only path
 
@@ -143,7 +124,7 @@ repo is a closed rail.
 shopping-skill/
 ├── SKILL.md                       # the Agent Skill: the flow the assistant follows
 ├── scripts/
-│   ├── facet-checkout.ts          # identity + money path (wallets, discover, buy, full lifecycle)
+│   ├── facet-checkout.ts          # internal identity + money-path implementation the MCP tools spawn
 │   ├── wallet.ts                  # mint a wallet (BIP-39), keychain/keystore storage, fund
 │   ├── kya-provision.ts           # self-serve wallet-bound KYA minter (no service key)
 │   ├── mcp-server.ts              # drive the whole skill over MCP (stdio JSON-RPC)

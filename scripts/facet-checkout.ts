@@ -119,12 +119,16 @@ import {
   walletIndexEntry,
 } from "./wallet.ts";
 
-// ---- network profile: the Base mainnet chain defaults, so a run needs no pile
-// of env vars. Every value below still honors its individual FACET_* override
-// when set; the profile only supplies the default. `usdcDomainName` is the token
-// contract's real EIP-712 name (Base mainnet USDC is "USD Coin"): a wrong name
-// makes the ERC-3009 signature recover the wrong signer, which the Terminal reads
-// as "buyer identity not bound to the paying wallet".
+// ---- network profile: one flag (FACET_NETWORK) selects a coherent set of chain
+// defaults, so a testnet run needs no pile of env vars. `base` is Base mainnet
+// (the default); `base-sepolia` is the sandbox testnet plane. Every value below
+// still honors its individual FACET_* override when set; the profile only
+// supplies the default. `usdcDomainName` is the token contract's real EIP-712
+// name (Base mainnet USDC is "USD Coin", Base Sepolia USDC is "USDC"): a wrong
+// name makes the ERC-3009 signature recover the wrong signer, which the Terminal
+// reads as "buyer identity not bound to the paying wallet". `originationSuffixes`
+// is empty for the sandbox because the sandbox platform serves no origination
+// endpoint, so a sandbox target checks out buyer-direct.
 interface NetworkProfile {
   readonly chain: number;
   readonly network: string;
@@ -134,15 +138,28 @@ interface NetworkProfile {
   readonly platform: string;
   readonly originationSuffixes: string;
 }
-const PROFILE: NetworkProfile = {
-  chain: 8453,
-  network: "base",
-  usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-  rpc: "https://base-rpc.publicnode.com",
-  usdcDomainName: "USD Coin",
-  platform: "https://api.facet.llc",
-  originationSuffixes: ".facet.llc",
+const NETWORK_PROFILES: Record<string, NetworkProfile> = {
+  base: {
+    chain: 8453,
+    network: "base",
+    usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    rpc: "https://base-rpc.publicnode.com",
+    usdcDomainName: "USD Coin",
+    platform: "https://api.facet.llc",
+    originationSuffixes: ".facet.llc",
+  },
+  "base-sepolia": {
+    chain: 84532,
+    network: "base-sepolia",
+    usdc: "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+    rpc: "https://sepolia.base.org",
+    usdcDomainName: "USDC",
+    platform: "https://api.sandbox.facet.llc",
+    originationSuffixes: ".sandbox.facet.llc",
+  },
 };
+const PROFILE = NETWORK_PROFILES[(Deno.env.get("FACET_NETWORK") ?? "base").toLowerCase()] ??
+  NETWORK_PROFILES.base;
 
 // ---- chain constants: the profile is the default, an explicit FACET_* wins ---
 const USDC = Deno.env.get("FACET_USDC_ADDRESS") ?? PROFILE.usdc;
@@ -159,6 +176,7 @@ export const EXPECT_NETWORK = Deno.env.get("FACET_EXPECT_NETWORK") ?? PROFILE.ne
 // Default to the Diamond for the expected chain; override deliberately via env.
 const BOSON_ESCROW_BY_CHAIN: Record<number, string> = {
   8453: "0x59A4C19b55193D5a2EAD0065c54af4d516E18Cb5", // Base mainnet Diamond
+  84532: "0x7de418a7ce94debd057c34ebac232e7027634ade", // Base Sepolia Diamond
 };
 const BOSON_ESCROW = (Deno.env.get("FACET_BOSON_ESCROW") ?? BOSON_ESCROW_BY_CHAIN[EXPECT_CHAIN] ?? "").toLowerCase();
 const TOKEN_DOMAIN_NAME = Deno.env.get("FACET_TOKEN_DOMAIN_NAME") ?? PROFILE.usdcDomainName;
@@ -184,6 +202,36 @@ const MAX_USDC_CEILING = posNumEnv("FACET_MAX_USDC_CEILING", 200);
 const DIRECTORY_TERMINAL = Deno.env.get("FACET_DIRECTORY_TERMINAL") ?? "https://api.facet.llc";
 const BOSON_HANDLER = "llc.facet.boson_escrow";
 const X402_HANDLER = "llc.facet.x402";
+
+// Rail-accurate buyer recourse, surfaced on every DRY and SETTLE buy result so the
+// agent relays the TRUTH at close instead of a blanket escrow promise. x402-direct
+// is NOT escrow (the money is the merchant's on settlement, half the network runs
+// this rail); Boson holds the funds until fulfillment. Exported so a test can pin
+// that x402 is never described as escrow-protected.
+export const X402_BUYER_PROTECTION = {
+  rail: "x402-direct",
+  escrow: false,
+  summary:
+    "This settles straight to the merchant's payout wallet. It is NOT held in escrow " +
+    "and there is no ship-gated release; the payment is the merchant's on settlement.",
+  recourse:
+    "If something is wrong, come back and open a request through the Terminal with your " +
+    'receipt: run `refund --order-id <id> --reason "..."` (whole-order, or add `--items` ' +
+    "for specific lines). It is a REQUEST, no money moves until the merchant reviews and " +
+    "approves; on approval the merchant sends the USDC back from its own payout wallet.",
+} as const;
+
+export const BOSON_BUYER_PROTECTION = {
+  rail: "boson-escrow",
+  escrow: true,
+  summary:
+    "Funds are held in Boson escrow, not paid to the merchant yet; they release to the " +
+    "merchant on fulfillment (redeem).",
+  recourse:
+    "Before fulfillment you can `cancel --exchange-id <id>` for a full refund (then " +
+    "`withdraw`); after redeem, `dispute` or `refund`. Funds stay in escrow until you " +
+    "confirm receipt or the window elapses.",
+} as const;
 // The JWS `typ` the Facet ledger stamps on a settlement receipt. Part of the
 // wire contract: the verifier routes on it and refuses anything else.
 const FACET_RECEIPT_TYP = "facet-receipt+jws";
@@ -199,7 +247,7 @@ const FACET_LIFECYCLE_TYP = "facet-lifecycle+jws";
 // and it forwards the buyer KYA verbatim as the merchant's KYA factor. The buyer
 // still signs its own ERC-3009 payment client-side, so no key or fund custody
 // ever reaches the server. Same host as the directory by default (one Fly app).
-const PLATFORM_TERMINAL_URL = Deno.env.get("FACET_PLATFORM_TERMINAL") ?? PROFILE.platform;
+export const PLATFORM_TERMINAL_URL = Deno.env.get("FACET_PLATFORM_TERMINAL") ?? PROFILE.platform;
 // Host suffixes treated as first-party, mirroring the Terminal's own origination
 // allowlist default (.facet.llc). A target whose host matches is routed through
 // PLATFORM_TERMINAL_URL; anything else checks out buyer-direct, because the
@@ -744,6 +792,34 @@ async function cmdDirectory(flags: Record<string, string | boolean>): Promise<ne
   });
 }
 
+// ---- stores: the PUBLIC directory of live merchants a buyer can check out at.
+//      Unlike `directory` (Facet's identity-gated index), this is the ungated
+//      GET /v1/stores count + list, so the agent can answer "how many stores can
+//      I buy from, and which" and hand off storefront URLs to browse with NO
+//      wallet and NO KYA. Each store carries a storefront_url (the site to
+//      browse) and a terminal_url (where agent checkout happens).
+async function cmdStores(flags: Record<string, string | boolean>): Promise<never> {
+  const base = terminalBase(
+    typeof flags.terminal === "string" ? flags.terminal : PLATFORM_TERMINAL_URL,
+  );
+  note(`GET ${base}/v1/stores`);
+  const r = await fetch(`${base}/v1/stores`, { method: "GET" });
+  const text = await r.text();
+  if (!r.ok) die(`live-store directory failed HTTP ${r.status}`, { body: text.slice(0, 400) });
+  const j = parseJsonObjOrDie(text, "stores") as {
+    count?: number;
+    stores?: Array<Record<string, unknown>>;
+    live?: boolean;
+  };
+  const stores = j.stores ?? [];
+  emit({
+    ok: true,
+    count: typeof j.count === "number" ? j.count : stores.length,
+    live: j.live ?? true,
+    stores,
+  });
+}
+
 // ---- search: the merchant's own catalog (KYA-authenticated) ----------------
 async function cmdSearch(flags: Record<string, string | boolean>): Promise<never> {
   const base = terminalBase(requireFlag(flags, "terminal"));
@@ -904,6 +980,25 @@ export function assertX402Terms(
     );
   }
   return priceAtomic;
+}
+
+// The wallet skill mints ONLY the evm/charge credential. Any other MPP method,
+// notably stripe/charge (a Stripe Shared Payment Token settling as a direct,
+// non-custodial charge on the merchant's OWN connected Stripe account, a card
+// credential this skill does not mint), is out of scope: throw a clear message so
+// the caller die()s with actionable guidance instead of a misleading USDC-terms
+// mismatch. Pure and exported so an offline unit test exercises it with no network.
+export function assertMppMethodEvm(method: string, intent: string): void {
+  if (String(method).toLowerCase() !== "evm") {
+    throw new Error(
+      `MPP charge uses the "${method}/${intent}" method, not the wallet USDC method ` +
+        `(evm/charge) this skill signs. The stripe/charge method settles a Stripe Shared ` +
+        `Payment Token as a direct, non-custodial charge on the merchant's own connected ` +
+        `Stripe account and needs a card credential this wallet-based skill does not mint. ` +
+        `Settle through facet_buy on the merchant's own rail, or use a card agent for the ` +
+        `Stripe method.`,
+    );
+  }
 }
 
 // The MPP sibling of assertX402Terms. Before mppx builds and the buyer's wallet
@@ -1150,6 +1245,193 @@ export function assertDisplayScalarsSane(
   return { priceAtomic, chainId: Number(chainRaw) };
 }
 
+// ---- Boson advertisement shape: pooled single offer vs per-line array --------
+// A UCP checkout's Boson handler (BOSON_HANDLER) advertises EITHER one pooled
+// seller-signed offer (the common case) or an ARRAY of per-line offers, one per
+// cart line, each carrying its own seller-signed offer and a `line_index`. The
+// skill signs one commit X-PAYMENT per advertised offer, so it must first learn
+// which shape it received. Per-line is signalled by a `line_index` on the entry
+// configs; a pooled checkout has a single entry with none. Fails CLOSED (throws)
+// on a malformed mix (some entries with a line_index, some without) or on multiple
+// pooled entries, so the caller never signs against a half-understood cart. Pure
+// and exported for offline testing.
+export type BosonAdvertisement =
+  | { readonly kind: "none" }
+  | { readonly kind: "pooled"; readonly config: Record<string, unknown> }
+  | { readonly kind: "perline"; readonly configs: Record<string, unknown>[] };
+
+export function classifyBosonAdvertisement(
+  entries: Array<{ config?: Record<string, unknown> }> | undefined,
+): BosonAdvertisement {
+  const configs = (entries ?? [])
+    .map((e) => e?.config)
+    .filter((c): c is Record<string, unknown> => c !== undefined && c !== null);
+  if (configs.length === 0) return { kind: "none" };
+  const withLine = configs.filter((c) => c["line_index"] !== undefined);
+  if (withLine.length === 0) {
+    // A pooled advertisement is always exactly one offer. More than one offer with
+    // no line_index is not a shape this client understands, so refuse it rather
+    // than silently committing only the first.
+    if (configs.length > 1) {
+      throw new Error(
+        `Boson advertisement has ${configs.length} offers but none carry a line_index; refusing an ambiguous cart.`,
+      );
+    }
+    return { kind: "pooled", config: configs[0] };
+  }
+  if (withLine.length !== configs.length) {
+    throw new Error(
+      "Boson advertisement mixes per-line and pooled offers; refusing an ambiguous cart.",
+    );
+  }
+  return { kind: "perline", configs };
+}
+
+// Read the server-advertised cart TOTAL (in the checkout currency's MINOR unit,
+// e.g. cents) from a UCP `totals` breakdown: the single entry of type "total".
+// This is the independent, server-derived figure the buyer is shown; the per-line
+// escrow path binds the offers it signs to it. Returns null when absent or
+// malformed. Pure and exported for offline testing.
+export function ucpTotalMinor(totals: unknown): number | null {
+  if (!Array.isArray(totals)) return null;
+  for (const t of totals) {
+    if (t !== null && typeof t === "object" && (t as Record<string, unknown>)["type"] === "total") {
+      const amt = (t as Record<string, unknown>)["amount"];
+      if (typeof amt === "number" && Number.isFinite(amt)) return amt;
+    }
+  }
+  return null;
+}
+
+// The N committed per-line exchange ids from a Boson per-line COMPLETE response.
+// The Terminal returns `escrow_lines`, one entry per settled line, each with its
+// own on-chain `exchange_id` (the handle a per-line cancel / redeem / dispute acts
+// on). Surfaced in the buy result as `exchange_ids` so the per-line lifecycle tools
+// can operate on the order. Returns [] when the response carried none. Pure and
+// exported for offline testing.
+export function extractExchangeIds(completion: Record<string, unknown>): string[] {
+  const lines = completion["escrow_lines"];
+  if (!Array.isArray(lines)) return [];
+  const ids: string[] = [];
+  for (const l of lines) {
+    if (l !== null && typeof l === "object") {
+      const id = (l as Record<string, unknown>)["exchange_id"];
+      if (typeof id === "string" && id !== "") ids.push(id);
+    }
+  }
+  return ids;
+}
+
+// The per-line escrow lines to archive at settle (exchange_id + sku + the sealed
+// per-line amount in MINOR units), so a later `render-receipt` can map a reversed
+// exchange back to its line + amount for the Amendments section without a live call.
+// `amount` is the sealed per-line atomic USDC (goods + its allocated tax); the receipt
+// renders minor units, so divide by 1e4. The escrow line carries no sku, so it is
+// resolved from the cart by line_index (a non-cart line, e.g. delivery, gets none).
+// Pure and exported for offline testing.
+export function extractEscrowLines(
+  completion: Record<string, unknown>,
+  cart: ReadonlyArray<{ id: string; qty: number }>,
+): Array<{ exchange_id: string; sku?: string; amount_minor?: number }> {
+  const lines = completion["escrow_lines"];
+  if (!Array.isArray(lines)) return [];
+  const out: Array<{ exchange_id: string; sku?: string; amount_minor?: number }> = [];
+  for (const l of lines) {
+    if (l === null || typeof l !== "object") continue;
+    const rec = l as Record<string, unknown>;
+    const exchangeId = String(rec["exchange_id"] ?? "");
+    if (exchangeId === "") continue;
+    const lineIndex = Number(rec["line_index"]);
+    const sku = Number.isInteger(lineIndex) ? cart[lineIndex]?.id : undefined;
+    const atomic = Number(rec["amount"]);
+    const amountMinor = Number.isFinite(atomic) ? Math.round(atomic / 10_000) : undefined;
+    out.push({
+      exchange_id: exchangeId,
+      ...(sku ? { sku } : {}),
+      ...(amountMinor !== undefined ? { amount_minor: amountMinor } : {}),
+    });
+  }
+  return out;
+}
+
+// A per-line commit line ready to assemble into the COMPLETE credential: the 0-based
+// cart line_index, the buyer's signed X-PAYMENT for that line, the seller-signed
+// offer echoed as `requirements`, and the line's atomic USDC amount (already proved
+// equal to the signed offer amount by assertOfferMatches).
+export interface BosonLineSigned {
+  readonly lineIndex: number;
+  readonly xPayment: string;
+  readonly requirements: Record<string, unknown>;
+  readonly amountAtomic: number;
+}
+
+// Assemble the Boson COMMIT payment instrument a UCP checkout COMPLETE carries, for
+// BOTH the pooled single-offer shape and the per-line N-offer shape. The pooled
+// credential is `{ type, x_payment, requirements }`; the per-line credential is
+// `{ type, lines: [{ line_index, x_payment, requirements }] }`, mirroring the
+// Terminal's bridgeBosonCheckoutCredential contract. For per-line it ALSO enforces,
+// client-side, the same invariant the Terminal enforces server-side: the per-line
+// amounts MUST sum (at the minor-unit granularity the total is quoted in) to the
+// server-advertised cart total, and each line_index must be a unique non-negative
+// integer. Throws (the caller turns it into a die()) on any mismatch, so a
+// re-partitioned or cross-seller cart is refused before COMPLETE. Pure and exported
+// so an offline test asserts the exact instrument with no wallet and no network.
+export function buildBosonCommitInstrument(
+  buyKya: string,
+  arg:
+    | { readonly kind: "pooled"; readonly xPayment: string; readonly requirements: Record<string, unknown> }
+    | { readonly kind: "perline"; readonly cartTotalMinor: number; readonly lines: readonly BosonLineSigned[] },
+): { instruments: Array<{ kya: string; credential: Record<string, unknown> }> } {
+  if (arg.kind === "pooled") {
+    return {
+      instruments: [
+        {
+          kya: buyKya,
+          credential: { type: "boson_commit_authorization", x_payment: arg.xPayment, requirements: arg.requirements },
+        },
+      ],
+    };
+  }
+  if (arg.lines.length === 0) {
+    throw new Error("per-line commit has no lines to settle.");
+  }
+  const seen = new Set<number>();
+  let sumAtomic = 0;
+  for (const ln of arg.lines) {
+    if (!Number.isInteger(ln.lineIndex) || ln.lineIndex < 0) {
+      throw new Error(`per-line commit line_index ${ln.lineIndex} is not a non-negative integer.`);
+    }
+    if (seen.has(ln.lineIndex)) {
+      throw new Error(`per-line commit has a duplicate line_index ${ln.lineIndex}.`);
+    }
+    seen.add(ln.lineIndex);
+    if (typeof ln.xPayment !== "string" || ln.xPayment === "") {
+      throw new Error(`per-line commit line ${ln.lineIndex} has no signed x_payment.`);
+    }
+    if (!Number.isFinite(ln.amountAtomic) || ln.amountAtomic <= 0) {
+      throw new Error(`per-line commit line ${ln.lineIndex} amount ${ln.amountAtomic} is not a positive atomic value.`);
+    }
+    sumAtomic += ln.amountAtomic;
+  }
+  // The independent cart-sum invariant: the offers we are about to settle must add
+  // up to the server-advertised cart total the buyer was shown. Compare at the
+  // minor-unit (cent) resolution the total is quoted in, so a whole-cent cart binds
+  // exactly and a mismatch (a dropped or re-priced line) is refused.
+  const sumMinor = Math.round(sumAtomic / 10_000);
+  if (sumMinor !== arg.cartTotalMinor) {
+    throw new Error(
+      `per-line amounts sum to ${sumMinor} (minor units) but the advertised cart total is ${arg.cartTotalMinor}; ` +
+        `the offered lines do not match the priced cart. Refusing.`,
+    );
+  }
+  const lines = [...arg.lines]
+    .sort((a, b) => a.lineIndex - b.lineIndex)
+    .map((ln) => ({ line_index: ln.lineIndex, x_payment: ln.xPayment, requirements: ln.requirements }));
+  return {
+    instruments: [{ kya: buyKya, credential: { type: "boson_commit_authorization", lines } }],
+  };
+}
+
 // Pull the actionable reason out of a Terminal error body. The Terminal wraps
 // auth failures as { error: { code: "UNAUTHORIZED", message: <reason> } }, so
 // the reason to key on (e.g. "signature_missing") lives in error.message, not
@@ -1316,6 +1598,20 @@ async function cmdMppCharge(flags: Record<string, string | boolean>): Promise<ne
   } catch (e) {
     die(`could not parse the MPP 402 challenge: ${e instanceof Error ? e.message : String(e)}`, {
       body: probeText.slice(0, 400),
+    });
+  }
+  // This wallet skill mints only the evm/charge credential (an ERC-3009 USDC
+  // authorization). If the merchant's MPP endpoint challenges a different method,
+  // most notably stripe/charge (a Stripe Shared Payment Token that settles as a
+  // direct, non-custodial charge on the merchant's OWN connected Stripe account, a
+  // card credential this skill does not mint), refuse with a clear message rather
+  // than a misleading USDC-terms mismatch.
+  try {
+    assertMppMethodEvm(String(challenge.method), String(challenge.intent));
+  } catch (e) {
+    die(e instanceof Error ? e.message : String(e), {
+      method: String(challenge.method),
+      intent: String(challenge.intent),
     });
   }
   const request = (challenge.request ?? {}) as {
@@ -1687,6 +1983,10 @@ async function cmdBuy(flags: Record<string, string | boolean>): Promise<never> {
     id: string;
     payment_handlers?: Record<string, Array<{ config?: Record<string, unknown> }>>;
     default_rail?: string;
+    // The server-derived UCP `totals` breakdown (minor units). The per-line escrow
+    // path reads its `total` entry to bind the per-line offer amounts to the cart
+    // total the buyer was shown; the pooled path never reads it.
+    totals?: unknown;
   };
   const handlers = session.payment_handlers ?? {};
   const x402cfg = handlers[X402_HANDLER]?.[0]?.config;
@@ -1710,6 +2010,8 @@ async function cmdBuy(flags: Record<string, string | boolean>): Promise<never> {
   }
   if (railArm === "x402" && x402cfg !== undefined) {
     // ==== x402-direct settlement path ======================================
+    // ONE code path for both planes (FACET_NETWORK selects chain/USDC/domain), a
+    // proxy of the mainnet x402 walker scripts/x402-demo/pnp-ucp-2item-mainnet.ts.
     // The buyer's ERC-3009 authorizes USDC straight to the merchant pay_to (no
     // escrow, no buyer protection): Facet custodies neither funds nor keys. The
     // platform RFC 9421 co-signature is added by the origination surface, same as
@@ -1848,6 +2150,9 @@ async function cmdBuy(flags: Record<string, string | boolean>): Promise<never> {
       items,
       ...(hasOrderAttributes ? { order_attributes: orderAttributes } : {}),
       shipping_email_pref: shippingEmailSignal,
+      // Rail-accurate buyer recourse (see X402_BUYER_PROTECTION): x402-direct is NOT
+      // escrow, so never tell the buyer it is held in escrow or releases on ship.
+      buyer_protection: X402_BUYER_PROTECTION,
     };
     // ---- DRY (default): stop before COMPLETE. Nothing moved. ----
     if (!settle) {
@@ -1973,6 +2278,294 @@ async function cmdBuy(flags: Record<string, string | boolean>): Promise<never> {
     die(`internal: Boson rail selected but no Boson handler on this checkout.`);
   }
 
+  // ==== PER-LINE escrow advertisement (N seller-signed offers, one per cart line) ==
+  // The Boson handler advertises EITHER a single pooled offer (the common case,
+  // handled unchanged below) or an ARRAY of per-line offers, each with its own
+  // seller-signed offer and a `line_index`. Classify from the advertised entries;
+  // when per-line, commit one voucher per line HERE (validate every offer through
+  // the SAME assertOfferMatches guardrails, sign one X-PAYMENT each, bind the
+  // per-line amounts to the server cart total, then settle a `lines` credential),
+  // and emit + exit. A pooled checkout falls through to the single-offer path below,
+  // byte-for-byte unchanged.
+  {
+    let advert: BosonAdvertisement;
+    try {
+      advert = classifyBosonAdvertisement(handlers[BOSON_HANDLER]);
+    } catch (e) {
+      die(`GUARDRAIL: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (advert.kind === "perline") {
+      // The independent, server-derived cart total the buyer is shown (UCP `totals`,
+      // minor units). Fail CLOSED if it is absent: without it there is nothing to
+      // bind the per-line offer amounts to, and an unbindable per-line cart must not
+      // settle.
+      const cartTotalMinor = ucpTotalMinor(session.totals);
+      if (cartTotalMinor === null) {
+        die("GUARDRAIL: this per-line checkout advertised no server cart total to bind the line amounts to. Refusing.");
+      }
+      // ---- validate each per-line offer with the SAME guardrails as the pooled path ----
+      const validated: Array<{ lineIndex: number; offer: Record<string, unknown>; priceAtomic: number; sellerId: string }> = [];
+      for (const cfg of advert.configs) {
+        const lineIndexRaw = cfg["line_index"];
+        const lineIndex = Number(lineIndexRaw);
+        if (!Number.isInteger(lineIndex) || lineIndex < 0) {
+          die(`GUARDRAIL: per-line offer has an invalid line_index "${String(lineIndexRaw)}". Refusing.`);
+        }
+        const offer = cfg["offer"] as Record<string, unknown> | undefined;
+        if (offer === undefined) {
+          die(`GUARDRAIL: per-line offer at line ${lineIndex} carried no seller-signed offer to commit against. Refusing.`);
+        }
+        let priceAtomic: number;
+        let chainId: number;
+        try {
+          const s = assertDisplayScalarsSane(cfg);
+          priceAtomic = s.priceAtomic;
+          chainId = s.chainId;
+        } catch (e) {
+          die(`GUARDRAIL: line ${lineIndex}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+        const net = String(cfg["network"] ?? "");
+        if (net !== EXPECT_NETWORK || chainId !== EXPECT_CHAIN) {
+          die(`GUARDRAIL: line ${lineIndex} offer is ${net}/${chainId}, expected ${EXPECT_NETWORK}/${EXPECT_CHAIN}. Refusing.`);
+        }
+        if (!Number.isFinite(priceAtomic) || priceAtomic <= 0 || priceAtomic > capAtomic) {
+          die(`GUARDRAIL: line ${lineIndex} price ${priceAtomic / 1e6} USDC outside (0, ${capUsdc}] cap. Raise --max-usdc only if intended.`);
+        }
+        // The authoritative choke point on the SELLER-SIGNED offer object, exactly as
+        // the pooled path applies it: amount (bound to this line's display price and
+        // the cap), asset (USDC), network/chain, and the Boson escrow Diamond recipient.
+        try {
+          assertOfferMatches(offer, { priceAtomic, capAtomic, usdc: USDC, chainId: EXPECT_CHAIN, escrow: BOSON_ESCROW });
+        } catch (e) {
+          die(`GUARDRAIL: line ${lineIndex}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+        validated.push({ lineIndex, offer, priceAtomic, sellerId: String(cfg["seller_id"] ?? "") });
+      }
+      // The cart total is the sum of the validated per-line amounts (each already
+      // proved equal to its seller-signed offer amount). Cap it as a per-checkout
+      // ceiling and confirm the wallet can fund the whole cart before signing.
+      const cartTotalAtomic = validated.reduce((n, v) => n + v.priceAtomic, 0);
+      if (!Number.isFinite(cartTotalAtomic) || cartTotalAtomic <= 0 || cartTotalAtomic > capAtomic) {
+        die(`GUARDRAIL: per-line cart total ${cartTotalAtomic / 1e6} USDC outside (0, ${capUsdc}] cap. Raise --max-usdc only if intended.`);
+      }
+      if (balance < BigInt(cartTotalAtomic)) {
+        die(
+          `insufficient funds: wallet holds ${Number(balance) / 1e6} USDC, checkout needs ${cartTotalAtomic / 1e6}. ` +
+            `Fund ${account.address} on ${EXPECT_NETWORK} first.`,
+          { need_atomic: cartTotalAtomic, have_atomic: balance.toString() },
+        );
+      }
+      // ---- sign one buyer ERC-3009 commit authorization per line, LOCALLY ----
+      const signer: Signer = {
+        getAddress: () => Promise.resolve(account.address),
+        signTypedData: (a) => account.signTypedData(a as Parameters<typeof account.signTypedData>[0]),
+      };
+      const client = createX402bClient({
+        signer,
+        subgraphUrls: { [EXPECT_CHAIN]: "https://boson-subgraph.invalid/placeholder" },
+        tokenDomainResolver: (asset: string, cid: number) => ({
+          name: TOKEN_DOMAIN_NAME,
+          version: "2",
+          chainId: cid,
+          verifyingContract: asset as `0x${string}`,
+        }),
+        policy: { tokenAuthStrategy: "erc3009", redeemMode: "commit-only", maxAmount: String(capAtomic) },
+      });
+      const signedLines: BosonLineSigned[] = [];
+      for (const v of validated) {
+        const xPayment = await client.handle402(v.offer);
+        signedLines.push({ lineIndex: v.lineIndex, xPayment, requirements: v.offer, amountAtomic: v.priceAtomic });
+      }
+      note(
+        `buyer commit signed locally for ${signedLines.length} line(s) (ERC-3009, own wallet, domain "${TOKEN_DOMAIN_NAME}" v2)`,
+      );
+
+      // Assemble the per-line credential AND enforce the cart-sum invariant (the
+      // offers must sum, at cent granularity, to the server-advertised cart total)
+      // before any settle. A mismatch throws here, so a re-partitioned cart never
+      // reaches COMPLETE.
+      let paymentInstruments: { instruments: Array<{ kya: string; credential: Record<string, unknown> }> };
+      try {
+        paymentInstruments = buildBosonCommitInstrument(buyKya, { kind: "perline", cartTotalMinor, lines: signedLines });
+      } catch (e) {
+        die(`GUARDRAIL: ${e instanceof Error ? e.message : String(e)}`);
+      }
+
+      // Per-line breakdown surfaced so a human sees WHERE each line's money goes
+      // (escrow Diamond + seller) and HOW MUCH, before confirming a settlement.
+      const lineSummary = validated
+        .map((v) => ({
+          line_index: v.lineIndex,
+          seller_id: v.sellerId,
+          price_atomic: v.priceAtomic,
+          price_usdc: v.priceAtomic / 1e6,
+          escrow_address: String(v.offer["escrowAddress"] ?? ""),
+          asset: String(v.offer["asset"] ?? ""),
+        }))
+        .sort((a, b) => a.line_index - b.line_index);
+
+      const summary = {
+        checkout_id: session.id,
+        chain_id: EXPECT_CHAIN,
+        network: EXPECT_NETWORK,
+        price_atomic: cartTotalAtomic,
+        price_usdc: cartTotalAtomic / 1e6,
+        // For a per-line cart every line settles into the same Boson escrow Diamond;
+        // the per-line seller routing is surfaced in `lines` below.
+        escrow_address: BOSON_ESCROW,
+        buyer: account.address,
+        balance_usdc: Number(balance) / 1e6,
+        rail: BOSON_HANDLER,
+        per_line: true,
+        lines: lineSummary,
+        items,
+        ...(hasOrderAttributes ? { order_attributes: orderAttributes } : {}),
+        shipping_email_pref: shippingEmailSignal,
+        buyer_protection: BOSON_BUYER_PROTECTION,
+      };
+
+      // ---- DRY (default): stop before COMPLETE. Nothing moved. ----
+      if (!settle) {
+        emit({
+          ok: true,
+          mode: "DRY",
+          ...summary,
+          signed: true,
+          settled: false,
+          confirm_atomic: cartTotalAtomic,
+          next: `to settle: buy ... --settle --confirm ${cartTotalAtomic}`,
+          message: `Ready to buy ${cartTotalAtomic / 1e6} USDC of ${items.length} item(s) across ${signedLines.length} ` +
+            `escrow line(s). Nothing has moved. Confirm with the user, then settle with --confirm ${cartTotalAtomic}.`,
+        });
+      }
+
+      // ---- SETTLE: requires an exact --confirm matching the live cart total ----
+      // Bound to the sum of the per-line offer amounts, which buildBosonCommitInstrument
+      // already proved equals the server-advertised cart total.
+      const confirm = flags.confirm;
+      if (typeof confirm !== "string" || Number(confirm) !== cartTotalAtomic) {
+        die(
+          `settle refused: --confirm must equal the freshly-advertised cart total ${cartTotalAtomic} (atomic), ` +
+            `the sum of the per-line seller-signed offer amounts. ` +
+            `Run the DRY buy again, show the user ${cartTotalAtomic / 1e6} USDC, then settle with --confirm ${cartTotalAtomic}.`,
+          { expected_confirm_atomic: cartTotalAtomic },
+        );
+      }
+
+      const completeUrl = usedPlatform
+        ? `${terminalBase(PLATFORM_TERMINAL_URL)}/ucp/v1/originated-checkouts/complete`
+        : `${base}/ucp/v1/checkout-sessions/${session.id}/complete`;
+      const completeBody = usedPlatform
+        ? {
+          target: base,
+          checkout_id: session.id,
+          payment: paymentInstruments,
+          ...(hasOrderAttributes ? { order_attributes: orderAttributes } : {}),
+        }
+        : {
+          payment: paymentInstruments,
+          ...(hasOrderAttributes ? { order_attributes: orderAttributes } : {}),
+        };
+      note(`POST ${completeUrl}  (REAL per-line settlement${usedPlatform ? ", platform-originated" : ""})`);
+      const cRes = await fetch(completeUrl, { method: "POST", headers: kyaHeaders(buyKya), body: JSON.stringify(completeBody) });
+      const cText = await cRes.text();
+      if (cRes.status < 200 || cRes.status >= 300) {
+        if ((cRes.status === 401 || cRes.status === 403) && /signature/i.test(errorReason(cText))) {
+          die(
+            `this store rejected the checkout co-signature at settlement.`,
+            { reason: "platform_cosignature_required", http_status: cRes.status, via_platform: usedPlatform },
+          );
+        }
+        die(`COMPLETE failed HTTP ${cRes.status}`, { body: cText.slice(0, 600) });
+      }
+      // Same explicit unconfirmed-state handler the pooled path uses: money may
+      // already have moved on a 2xx, so a bad body must NOT read like "nothing
+      // happened" and invite a naive --settle retry.
+      let completion: Record<string, unknown>;
+      try {
+        const parsed = JSON.parse(cText);
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("settlement response was not a JSON object");
+        }
+        completion = parsed as Record<string, unknown>;
+      } catch {
+        die(
+          "settlement response could not be parsed",
+          {
+            settled: "unconfirmed",
+            warning:
+              "the settlement POST was accepted (HTTP 2xx) but its response body was not parseable JSON; " +
+              "DO NOT retry --settle. Verify the order and on-chain state before any re-attempt.",
+            http_status: cRes.status,
+            body: cText.slice(0, 500),
+          },
+        );
+      }
+      const settledOrderId = (completion.order as { id?: string } | undefined)?.id ??
+        (typeof completion.order_id === "string" ? completion.order_id : null);
+      // The N committed per-line exchange ids (the handles the per-line cancel /
+      // redeem / dispute tools act on), read from the Terminal's escrow_lines.
+      const exchangeIds = extractExchangeIds(completion);
+      const bosonPayment: Record<string, unknown> = {
+        escrow: BOSON_ESCROW,
+        commit_authorizations: signedLines.length,
+        lines: lineSummary.map((l) => ({ line_index: l.line_index, price_atomic: l.price_atomic })),
+        exchange_ids: exchangeIds,
+      };
+      const buildBosonProvenance = (receiptInfo: Record<string, unknown> | null) =>
+        buildProvenance({
+          rail: "boson",
+          kya: buyKya,
+          payment: bosonPayment,
+          checkoutId: session.id,
+          orderId: settledOrderId,
+          settlementId: typeof completion.settlement_id === "string" ? completion.settlement_id : null,
+          receipt: receiptInfo,
+        });
+      let receipt: Record<string, unknown> | null = null;
+      let provenance: Record<string, unknown> = buildBosonProvenance(null);
+      if (typeof settledOrderId === "string" && settledOrderId !== "") {
+        let { entry, note: rnote, status } = await fetchReceipt(base, settledOrderId, buyKya);
+        if (entry === null && status === 403) {
+          const walletAuth = await walletReceiptAuth(wallet.key, settledOrderId);
+          ({ entry, note: rnote, status } = await fetchReceipt(base, settledOrderId, buyKya, walletAuth));
+        }
+        if (entry !== null) {
+          const vr = await verifyReceipt(entry, base);
+          receipt = { jws: entry.jws, kid: entry.kid, provider_jwks: entry.provider_jwks, ...vr };
+          provenance = buildBosonProvenance(receipt);
+          const saved = saveReceipt(
+            base,
+            settledOrderId,
+            entry,
+            vr.verified === true,
+            provenance,
+            items.map((c) => ({ sku: c.id, qty: c.qty })),
+            extractEscrowLines(completion, items),
+          );
+          receipt.saved = saved.saved;
+          if (saved.path !== undefined) receipt.saved_path = saved.path;
+        } else {
+          receipt = { available: false, note: rnote };
+        }
+      }
+      emit({
+        ok: true,
+        mode: "SETTLE",
+        ...summary,
+        settled: true,
+        status: completion.status ?? null,
+        order_id: settledOrderId,
+        settlement_id: completion.settlement_id ?? null,
+        // The per-line handles for the cancel / redeem / dispute lifecycle tools.
+        exchange_ids: exchangeIds,
+        receipt,
+        provenance,
+        settlement: completion,
+      });
+    }
+  }
+
   const requirements = boson["offer"] as Record<string, unknown> | undefined;
   // Validate the display scalars before they gate the balance check or feed
   // BigInt(priceAtomic) downstream. A fractional price (e.g. "5.5") is finite
@@ -2081,6 +2674,9 @@ async function cmdBuy(flags: Record<string, string | boolean>): Promise<never> {
     // never asked, so ask the buyer once before settling, then store the answer
     // with `email-pref set ...` and it is reused on every future order.
     shipping_email_pref: shippingEmailSignal,
+    // Rail-accurate buyer recourse (see BOSON_BUYER_PROTECTION): Boson escrow holds
+    // the funds until fulfillment, so the escrow-protection language is correct here.
+    buyer_protection: BOSON_BUYER_PROTECTION,
   };
 
   // ---- DRY (default): stop before COMPLETE. Nothing moved. ----
@@ -2230,7 +2826,14 @@ async function cmdBuy(flags: Record<string, string | boolean>): Promise<never> {
       const v = await verifyReceipt(entry, base);
       receipt = { jws: entry.jws, kid: entry.kid, provider_jwks: entry.provider_jwks, ...v };
       provenance = buildBosonProvenance(receipt);
-      const saved = saveReceipt(base, settledOrderId, entry, v.verified === true, provenance);
+      const saved = saveReceipt(
+        base,
+        settledOrderId,
+        entry,
+        v.verified === true,
+        provenance,
+        items.map((c) => ({ sku: c.id, qty: c.qty })),
+      );
       receipt.saved = saved.saved;
       if (saved.path !== undefined) receipt.saved_path = saved.path;
     } else {
@@ -2298,15 +2901,28 @@ function bosonSignClient(walletKey: string): {
   };
 }
 
-// Sign a single-factor Boson action (redeem, cancel, raise/retract/escalate) as a
-// gasless buyer meta-tx.
+// The buyer post-commit action ids the x402-client's signAction understands
+// (@bosonprotocol/x402-client@0.3.1 dist/esm/index.js callSignMetaTx switch): the
+// skill already forwards "boson-redeem" and "boson-cancelVoucher" verbatim, and the
+// buyer's completeExchange meta-tx is keyed "boson-completeExchange" there (it calls
+// coreSdk.signMetaTxCompleteExchange, core-sdk@1.48.0 meta-tx/handler.js:787). The
+// skill exposes the shorter "boson-complete" id (it matches the deferred arm's
+// complete_payload field); translate it here so the call reaches the right SDK signer
+// while callers keep the skill-local name. Every other id already matches the client
+// verbatim, so this map is a no-op for them; an unmapped id falls through unchanged.
+const BOSON_ACTION_ALIASES: Record<string, string> = {
+  "boson-complete": "boson-completeExchange",
+};
+
+// Sign a single-factor Boson action (redeem, cancel, complete, raise/retract/escalate)
+// as a gasless buyer meta-tx.
 export async function signBosonAction(
   walletKey: string,
   actionId: string,
   exchangeId: string,
 ): Promise<string> {
   const { signedPayload } = await bosonSignClient(walletKey).signAction({
-    actionId,
+    actionId: BOSON_ACTION_ALIASES[actionId] ?? actionId,
     exchangeId,
     network: `eip155:${EXPECT_CHAIN}`,
     escrowAddress: BOSON_ESCROW,
@@ -2439,12 +3055,69 @@ async function submitLifecycleWithReceipt(
   emit({ ok: true, ...r.json, receipt });
 }
 
+// Parse a per-line lifecycle selection: --exchange-ids '["26","27","28"]' (a JSON array)
+// or a comma list. Returns undefined when absent, so the caller falls back to the single
+// --exchange-id pooled path. A per-line cart acts on this SET through the Terminal's
+// per-line routes (cancel_line_items / redeem_line_items), which the pooled single-exchange
+// path never reaches; the buy result surfaces the set as `exchange_ids`.
+export function parseExchangeIds(
+  flags: Record<string, string | boolean>,
+): string[] | undefined {
+  const raw = flags["exchange-ids"];
+  if (typeof raw !== "string" || raw.trim() === "") return undefined;
+  const t = raw.trim();
+  let parsed: unknown;
+  if (t.startsWith("[")) {
+    try {
+      parsed = JSON.parse(t);
+    } catch {
+      die("--exchange-ids must be a JSON array of exchange id strings (or a comma list).");
+    }
+  } else {
+    parsed = t
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s !== "");
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    die("--exchange-ids must be a non-empty array of exchange id strings.");
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const id of parsed) {
+    if (typeof id !== "string" || id === "") {
+      die("--exchange-ids entries must be non-empty exchange id strings.");
+    }
+    if (seen.has(id)) die(`--exchange-ids has a duplicate exchange id ${id}.`);
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
 // ---- redeem: confirm receipt, release the escrow to the seller -------------
+// A per-line cart (--exchange-ids) redeems ALL its vouchers together: the Terminal's
+// per-line redeem gate requires the delivery voucher in the same call as any goods line
+// (delivery is captured on fulfillment, never left to expire back to the buyer), so a
+// per-line redeem carries the whole set from the buy result's `exchange_ids`. A single
+// pooled voucher still uses --exchange-id.
 async function cmdRedeem(flags: Record<string, string | boolean>): Promise<never> {
   const base = terminalBase(requireFlag(flags, "terminal"));
-  const exchangeId = requireFlag(flags, "exchange-id");
   const wallet = resolveWallet(typeof flags.wallet === "string" ? flags.wallet : undefined);
   const kya = await walletBoundKya(wallet);
+  const perLine = parseExchangeIds(flags);
+  if (perLine !== undefined) {
+    const redeem_line_items: Array<{ exchange_id: string; signed_payload: string }> = [];
+    for (const exchangeId of perLine) {
+      note(
+        `signing boson-redeem for exchange ${exchangeId} locally (gasless; no key leaves this process)`,
+      );
+      const signed_payload = await signBosonAction(wallet.key, "boson-redeem", exchangeId);
+      redeem_line_items.push({ exchange_id: exchangeId, signed_payload });
+    }
+    return submitLifecycle(base, "/ucp/v1/checkout-sessions/redeem", { redeem_line_items }, kya);
+  }
+  const exchangeId = requireFlag(flags, "exchange-id");
   note(`signing boson-redeem for exchange ${exchangeId} locally (gasless; no key leaves this process)`);
   const signedPayload = await signBosonAction(wallet.key, "boson-redeem", exchangeId);
   return submitLifecycle(
@@ -2460,27 +3133,86 @@ async function cmdRedeem(flags: Record<string, string | boolean>): Promise<never
 //   escrow to the buyer's Boson available-funds, then withdraw moves it to the
 //   buyer's own wallet, in one command (the operator's requested UX). Cancel
 //   behavior is byte-identical to before when --withdraw is absent.
+// A single-exchange cancel posts { exchange_id, signed_payload } to the pooled
+// /ucp/v1/checkout-sessions/cancel path, which resolves a single-voucher checkout
+// session. A PER-LINE order has no such pooled session, so that exact body 404s; the
+// SAME exchange cancels through the per-line body { cancel_line_items: [...] }. Post
+// the pooled shape, and ONLY on a 404 retry it as a one-item per-line set, so a
+// single-line cancel works for both order shapes without the caller having to know
+// which it is. Any other failure is returned unchanged (never reshape a real error).
+export async function postSingleCancel(
+  base: string,
+  exchangeId: string,
+  signedPayload: string,
+  kya: string,
+): Promise<LifecyclePost> {
+  const pooled = await tryPostLifecycle(base, "/ucp/v1/checkout-sessions/cancel", {
+    exchange_id: exchangeId,
+    signed_payload: signedPayload,
+  }, kya);
+  if (pooled.ok || pooled.http_status !== 404) return pooled;
+  note(
+    `exchange ${exchangeId} has no pooled checkout session (a per-line order); ` +
+      `retrying the cancel through the per-line route`,
+  );
+  return tryPostLifecycle(base, "/ucp/v1/checkout-sessions/cancel", {
+    cancel_line_items: [{ exchange_id: exchangeId, signed_payload: signedPayload }],
+  }, kya);
+}
+
 async function cmdCancel(flags: Record<string, string | boolean>): Promise<never> {
   const base = terminalBase(requireFlag(flags, "terminal"));
-  const exchangeId = requireFlag(flags, "exchange-id");
   const wallet = resolveWallet(typeof flags.wallet === "string" ? flags.wallet : undefined);
   const kya = await walletBoundKya(wallet);
+
+  // Per-line cart (--exchange-ids): cancel the SELECTED vouchers via the per-line route
+  // (cancel_line_items), which the delivery-capture gate enforces. A standalone delivery
+  // voucher cancel is refused unless every goods line is also in the selection (a full-order
+  // cancel); a partial goods cancel leaves delivery and the unselected lines committed. The
+  // returned escrow lands in protocol available-funds; cash out with `withdraw`.
+  const perLine = parseExchangeIds(flags);
+  if (perLine !== undefined) {
+    const cancel_line_items: Array<{ exchange_id: string; signed_payload: string }> = [];
+    for (const exId of perLine) {
+      note(
+        `signing boson-cancelVoucher for exchange ${exId} locally (gasless; no key leaves this process)`,
+      );
+      const signed_payload = await signBosonAction(wallet.key, "boson-cancelVoucher", exId);
+      cancel_line_items.push({ exchange_id: exId, signed_payload });
+    }
+    const r = await tryPostLifecycle(
+      base,
+      "/ucp/v1/checkout-sessions/cancel",
+      { cancel_line_items },
+      kya,
+    );
+    if (!r.ok) dieLifecycle("/ucp/v1/checkout-sessions/cancel", r);
+    const walletArg =
+      typeof flags.wallet === "string" && flags.wallet !== "" ? ` --wallet ${flags.wallet}` : "";
+    return emit({
+      ok: true,
+      ...r.json,
+      next: `withdraw --terminal ${base}${walletArg} --exchange-id ${perLine[0]}`,
+      message: `Cancelled ${perLine.length} per-line voucher(s). The escrow returned to your ` +
+        `protocol available-funds; run withdraw to cash out.`,
+    });
+  }
+
+  const exchangeId = requireFlag(flags, "exchange-id");
   note(`signing boson-cancelVoucher for exchange ${exchangeId} locally (gasless; no key leaves this process)`);
   const signedPayload = await signBosonAction(wallet.key, "boson-cancelVoucher", exchangeId);
-  const cancelBody = { exchange_id: exchangeId, signed_payload: signedPayload };
-
   if (flags.withdraw !== true) {
-    return submitLifecycleWithReceipt(base, "/ucp/v1/checkout-sessions/cancel", cancelBody, kya, {
-      kind: "cancel",
-      exchangeId,
-    });
+    const r = await postSingleCancel(base, exchangeId, signedPayload, kya);
+    if (!r.ok) dieLifecycle("/ucp/v1/checkout-sessions/cancel", r);
+    const receipt = await fetchVerifySaveLifecycle(base, { kind: "cancel", exchangeId }, kya);
+    return emit({ ok: true, ...r.json, receipt });
   }
 
   // --withdraw: post the cancel first and only proceed once it is confirmed; the
   // escrow is then credited to the buyer's protocol available-funds and the
   // withdraw can move it to the wallet. Keep the cancel receipt so a withdraw-leg
   // problem never reads as "nothing happened".
-  const cancel = await tryPostLifecycle(base, "/ucp/v1/checkout-sessions/cancel", cancelBody, kya);
+  const cancel = await postSingleCancel(base, exchangeId, signedPayload, kya);
   if (!cancel.ok) dieLifecycle("/ucp/v1/checkout-sessions/cancel", cancel);
   note(`cancel confirmed; preparing the gasless withdraw of the returned escrow`);
   // Archive the cancel's signed reversal receipt now, on the same KYA that cancelled,
@@ -2547,7 +3279,6 @@ export const DISPUTE_ACTION_ID: Record<string, string> = {
 };
 async function cmdDispute(flags: Record<string, string | boolean>): Promise<never> {
   const base = terminalBase(requireFlag(flags, "terminal"));
-  const exchangeId = requireFlag(flags, "exchange-id");
   const action = typeof flags.action === "string" ? flags.action : "raise";
   const actionId = DISPUTE_ACTION_ID[action];
   if (actionId === undefined) {
@@ -2558,6 +3289,21 @@ async function cmdDispute(flags: Record<string, string | boolean>): Promise<neve
   }
   const wallet = resolveWallet(typeof flags.wallet === "string" ? flags.wallet : undefined);
   const kya = await walletBoundKya(wallet);
+
+  // Per-line cart (--exchange-ids): apply the dispute action to a SELECTION of redeemed
+  // lines via the per-line route (dispute_line_items), each with its own signed meta-tx.
+  const perLine = parseExchangeIds(flags);
+  if (perLine !== undefined) {
+    const dispute_line_items: Array<Record<string, unknown>> = [];
+    for (const exId of perLine) {
+      note(`signing ${actionId} for exchange ${exId} locally (gasless; no key leaves this process)`);
+      const signed_payload = await signBosonAction(wallet.key, actionId, exId);
+      dispute_line_items.push({ exchange_id: exId, action, signed_payload });
+    }
+    return submitLifecycle(base, "/ucp/v1/checkout-sessions/dispute", { dispute_line_items }, kya);
+  }
+
+  const exchangeId = requireFlag(flags, "exchange-id");
   note(`signing ${actionId} for exchange ${exchangeId} locally (gasless; no key leaves this process)`);
   const signedPayload = await signBosonAction(wallet.key, actionId, exchangeId);
   return submitLifecycleWithReceipt(
@@ -3861,6 +4607,8 @@ function saveReceipt(
   entry: ReceiptEntry,
   verified: boolean | null,
   provenance?: Record<string, unknown> | null,
+  items?: ReadonlyArray<{ sku: string; qty: number; name?: string; amount_minor?: number }> | null,
+  escrowLines?: ReadonlyArray<{ exchange_id: string; sku?: string; amount_minor?: number }> | null,
 ): { saved: boolean; path?: string; note?: string } {
   const dir = receiptsDir();
   let claims: Record<string, unknown> = {};
@@ -3884,6 +4632,19 @@ function saveReceipt(
     // verification), archived so `render-receipt` can show it for a past order.
     // Absent on a plain re-fetch (get_receipt returns no provenance).
     ...(provenance !== undefined && provenance !== null ? { provenance } : {}),
+    // The purchased cart (sku + qty), archived at settle so `render-receipt` can
+    // show line items for a PLATFORM-ORIGINATED order (a multi-item UCP cart is
+    // owned by the origin aid, so the buyer's aid-scoped order_history does not
+    // return it and the render-time item lookup finds nothing). Absent on a plain
+    // re-fetch, which carries no cart.
+    ...(items !== undefined && items !== null && items.length > 0 ? { items } : {}),
+    // The per-line escrow lines (exchange_id + sku + sealed per-line amount in minor
+    // units), archived at settle so a later `render-receipt` can map a reversed exchange
+    // back to its line + amount and show it in the Amendments section, WITHOUT a live
+    // call (the checkout session is gone once the order settles). Per-line orders only.
+    ...(escrowLines !== undefined && escrowLines !== null && escrowLines.length > 0
+      ? { escrow_lines: escrowLines }
+      : {}),
     saved_at: savedAt,
   };
   try {
@@ -4122,6 +4883,111 @@ async function cmdLifecycleReceipt(flags: Record<string, string | boolean>): Pro
 //      comes from the archive a `buy --settle` wrote (get_receipt itself carries
 //      none), or from an explicit --provenance-file. Writes the HTML and returns its
 //      path; nothing about the receipt is secret, so the file is shareable.
+
+/** One post-settlement reversal, for the receipt's Amendments section. `signatures`
+ *  are the recorded signed lifecycle receipts for the reversed line (a per-line cancel
+ *  and its withdraw, a merchant refund, etc.), each a verifiable compact JWS. */
+interface ReversalEntry {
+  kind: "cancel" | "withdraw" | "dispute" | "refund";
+  exchange_id: string;
+  sku?: string;
+  name?: string;
+  amount_minor?: number;
+  signatures?: Array<
+    { kind: string; jws: string; kid?: string; tx_hash?: string; verified?: boolean | null }
+  >;
+}
+
+/** Read an archived signed lifecycle (reversal) receipt for one exchange, if the
+ *  buyer performed one. Prefers a withdraw (its tx is the buyer's on-chain cash-out)
+ *  over a bare cancel, so the Amendments row can link the money move. Returns the
+ *  event kind, its tx hash, and the offline-verified flag, or null when none is
+ *  archived. Reads only local files; no network, no key. */
+function readArchivedLifecycles(
+  exchangeId: string,
+): Array<{ kind: string; jws: string; kid?: string; tx_hash?: string; verified?: boolean | null }> {
+  const out: Array<
+    { kind: string; jws: string; kid?: string; tx_hash?: string; verified?: boolean | null }
+  > = [];
+  for (const kind of ["cancel", "refund", "withdraw", "dispute"]) {
+    try {
+      const rec = JSON.parse(
+        Deno.readTextFileSync(`${receiptsDir()}/lifecycle-${kind}-${exchangeId}.json`),
+      ) as {
+        kind?: string;
+        jws?: string;
+        kid?: string;
+        verified?: boolean | null;
+        claims?: { event?: { tx_hash?: string } };
+      };
+      if (typeof rec.jws !== "string" || rec.jws === "") continue;
+      const tx = rec.claims?.event?.tx_hash;
+      out.push({
+        kind: typeof rec.kind === "string" ? rec.kind : kind,
+        jws: rec.jws,
+        ...(typeof rec.kid === "string" && rec.kid !== "" ? { kid: rec.kid } : {}),
+        ...(typeof tx === "string" && tx !== "" ? { tx_hash: tx } : {}),
+        verified: rec.verified ?? null,
+      });
+    } catch {
+      // No receipt of this kind for this exchange; try the next.
+    }
+  }
+  return out;
+}
+
+/** Discover post-settlement reversals for an order: read the live per-line escrow
+ *  state (the same owner-scoped checkout-session read facet_lines uses), take every
+ *  line now Revoked/Canceled, price it from the line's escrow amount (atomic USDC ->
+ *  minor units), resolve its SKU/name, and attach the archived signed lifecycle
+ *  receipt (tx + verified) as proof. Best-effort and non-throwing: returns [] when
+ *  the session is unreachable or no line is reversed, so the receipt still renders. */
+function discoverReversals(
+  orderId: string,
+  items: ReadonlyArray<{ name: string; sku: string; qty: number; amount_minor?: number }>,
+): ReversalEntry[] {
+  // Archive-driven (no live call): a settled order's checkout session is gone (404),
+  // so read the order's escrow lines from the settlement archive (exchange_id + sku +
+  // name + amount_minor per line, written by `buy --settle`), and for each line that
+  // has a signed lifecycle receipt in the archive, build a reversal carrying that line's
+  // amount + the recorded signatures.
+  let escrowLines: Array<
+    { exchange_id?: string; sku?: string; name?: string; amount_minor?: number }
+  > = [];
+  try {
+    const archived = JSON.parse(Deno.readTextFileSync(`${receiptsDir()}/${orderId}.json`)) as {
+      escrow_lines?: Array<
+        { exchange_id?: string; sku?: string; name?: string; amount_minor?: number }
+      >;
+    };
+    if (Array.isArray(archived.escrow_lines)) escrowLines = archived.escrow_lines;
+  } catch {
+    return [];
+  }
+  const out: ReversalEntry[] = [];
+  for (const line of escrowLines) {
+    const exchangeId = String(line.exchange_id ?? "");
+    if (exchangeId === "") continue;
+    const signatures = readArchivedLifecycles(exchangeId);
+    if (signatures.length === 0) continue; // this line was not reversed
+    // A merchant refund receipt makes it a refund; a seller revoke or buyer cancel is a cancel.
+    const kind: ReversalEntry["kind"] = signatures.some((s) => s.kind === "refund")
+      ? "refund"
+      : "cancel";
+    const sku = line.sku ?? undefined;
+    const name = line.name ?? (sku ? items.find((it) => it.sku === sku)?.name : undefined);
+    out.push({
+      kind,
+      exchange_id: exchangeId,
+      ...(sku ? { sku } : {}),
+      ...(name ? { name } : {}),
+      ...(typeof line.amount_minor === "number" ? { amount_minor: line.amount_minor } : {}),
+      signatures,
+    });
+  }
+  return out;
+}
+
 async function cmdRenderReceipt(flags: Record<string, string | boolean>): Promise<never> {
   const base = terminalBase(requireFlag(flags, "terminal"));
   const orderId = requireFlag(flags, "order-id").trim();
@@ -4205,6 +5071,49 @@ async function cmdRenderReceipt(flags: Record<string, string | boolean>): Promis
       die(`could not read --items-file: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
+  // The cart archived by `buy --settle` (sku + qty). This is the reliable source
+  // for a PLATFORM-ORIGINATED order (a multi-item UCP cart is owned by the origin
+  // aid, so order_history below, scoped to the buyer's aid, returns nothing). Each
+  // display name is resolved from get_product, which is not ownership-scoped.
+  if (items.length === 0) {
+    try {
+      const archived = JSON.parse(await Deno.readTextFile(`${receiptsDir()}/${orderId}.json`)) as {
+        items?: Array<{ sku?: unknown; qty?: unknown; name?: unknown; amount_minor?: unknown }>;
+      };
+      const cart = Array.isArray(archived?.items) ? archived.items : [];
+      for (const li of cart) {
+        const sku = String(li?.sku ?? "");
+        if (sku === "") continue;
+        const qty = Number(li?.qty ?? 1);
+        let name = typeof li?.name === "string" && li.name !== "" ? li.name : sku;
+        if (name === sku) {
+          try {
+            const pRes = await fetch(`${base}/v1/get_product`, {
+              method: "POST",
+              headers: kyaHeaders(buyKya),
+              body: JSON.stringify({ product_id: sku }),
+            });
+            if (pRes.ok) {
+              const body = parseJsonObjOrDie(await pRes.text(), "get_product");
+              const prod = ((body.product ?? body) as { name?: unknown });
+              if (typeof prod.name === "string" && prod.name !== "") name = prod.name;
+            }
+          } catch {
+            // Keep the SKU as the display name.
+          }
+        }
+        items.push({
+          name,
+          sku,
+          qty,
+          ...(typeof li?.amount_minor === "number" ? { amount_minor: li.amount_minor } : {}),
+        });
+      }
+    } catch {
+      // No archive for this order (e.g. a receipt fetched on another machine);
+      // fall through to the aid-scoped order_history for a buyer-owned order.
+    }
+  }
   if (items.length === 0) {
     try {
       const hRes = await fetch(`${base}/v1/order_history`, {
@@ -4278,6 +5187,12 @@ async function cmdRenderReceipt(flags: Record<string, string | boolean>): Promis
     serverTrail = sres.trail;
   }
 
+  // Post-settlement reversals: read the order's archived escrow lines and, for each
+  // line that has a signed lifecycle receipt in the archive, attach it. Drives the
+  // Amendments section + a Net-now line. Archive-driven (no live call), so it works
+  // after settlement; an order with no archived escrow lines omits the section.
+  const reversals = discoverReversals(orderId, items);
+
   // Read the official template and fill it.
   const templatePath = new URL("../references/receipt-template.html", import.meta.url);
   let template = "";
@@ -4289,11 +5204,13 @@ async function cmdRenderReceipt(flags: Record<string, string | boolean>): Promis
   const html = fillReceiptTemplate(template, {
     jws,
     pubkeyX,
+    verified: verified.verified === true,
     merchant,
     provenance,
     orderUrl,
     items,
     ...(serverTrail !== null ? { serverTrail } : {}),
+    ...(reversals.length > 0 ? { reversals } : {}),
   });
 
   const out = typeof flags.out === "string" && flags.out !== ""
@@ -4430,6 +5347,9 @@ if (import.meta.main) {
         break;
       case "directory":
         await cmdDirectory(flags);
+        break;
+      case "stores":
+        await cmdStores(flags);
         break;
       case "search":
         await cmdSearch(flags);

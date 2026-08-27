@@ -12,7 +12,8 @@ or the user's key.**
 - The wallet private key is read from an environment variable, used to sign
   locally inside the Deno process, and is never transmitted, logged, or written
   to disk. Only the resulting signature leaves the process.
-- Funds move on-chain directly from the user's wallet into the merchant's escrow.
+- Funds move on-chain directly from the user's wallet to the merchant's rail
+  destination: Boson escrow, or the merchant's own payout wallet on x402-direct.
   No Facet server, and no other third party, is a custodian at any step.
 - The identity token is a wallet-bound Facet KYA the user self-issues by proving
   control of the wallet. No issuer service key exists in this repository.
@@ -25,7 +26,7 @@ the invariant.
 The client is transparent about what it contacts and what it stores. It makes
 network calls only to:
 
-- **The merchant Terminal you point it at** (the `--terminal` host): discovery,
+- **The merchant Terminal you point it at** (the `terminal` argument): discovery,
   quoting, checkout, and settlement.
 - **The Facet issuer** (`issuer.facet.llc`, override with `FACET_ISSUER_URL`): to
   self-issue a wallet-bound KYA. No issuer service key is used; the request carries

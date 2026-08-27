@@ -33,6 +33,7 @@ const TEMPLATE = [
   "<div class=chips>%%CHIPS%%</div>",
   "<div class=items>%%ITEMS%%</div>",
   "<dl class=breakdown>%%BREAKDOWN%%</dl>",
+  "<div class=amend>%%AMENDMENTS%%</div>",
   "%%PROVENANCE%%",
   "<dl class=settle>%%SETTLEMENT_KV%%</dl>",
   "<dl class=signedby>%%SIGNEDBY_KV%%</dl>",
@@ -42,6 +43,9 @@ const TEMPLATE = [
   '<a href="%%JWKS_HREF%%">keys</a>',
   "<span>%%RECEIPT_SHORT%%</span> at <span>%%MERCHANT_HOST%%</span>",
   "<script>const JWS = %%JWS%%; const PUBKEY_X = %%PUBKEY_X%%;</script>",
+  "<pre id=hdrOut>%%HDR_JSON%%</pre><pre id=claimsOut>%%CLAIMS_JSON%%</pre>",
+  '<div class="%%SEAL_CLASS%%"><b>%%SEAL_WORD%%</b><span>%%SEAL_STATUS%%</span></div>',
+  '<code id=jwsOut>%%JWS_SPANS%%</code><code id=snippet>%%SNIPPET%%</code>',
 ].join("\n");
 
 Deno.test("fillReceiptTemplate renders money, breakdown, items, and settlement server-side", () => {
@@ -64,10 +68,107 @@ Deno.test("fillReceiptTemplate renders money, breakdown, items, and settlement s
   assertStringIncludes(html, "50496f69thishash"); // ledger rendered
 });
 
+Deno.test("fillReceiptTemplate renders the Amendments section with a Net-now line", () => {
+  const html = fillReceiptTemplate(TEMPLATE, {
+    jws: makeJws(CLAIMS),
+    pubkeyX: "k",
+    merchant: { name: "Pecan & Petal", host: "pecanandpetal.facet.llc" },
+    items: [{ name: "Birthday Flower Arrangement", sku: "HCF-BDAY", qty: 1, amount_minor: 1500 }],
+    reversals: [
+      {
+        kind: "cancel",
+        exchange_id: "48",
+        sku: "HCF-CARD",
+        name: "Birthday & Anniversary Card",
+        amount_minor: 325,
+        signatures: [
+          { kind: "cancel", jws: "eyJhbGciOiJFZERTQQ.cancelpayload.cancelsig", verified: true },
+          {
+            kind: "withdraw",
+            jws: "eyJhbGciOiJFZERTQQ.withdrawpayload.withdrawsig",
+            tx_hash: "0x76f14ca56a12bf94dd69b639f5da640edc29b2ad2ed5ed9279096129e5d7dc13",
+            verified: true,
+          },
+        ],
+      },
+    ],
+  });
+  assert(!html.includes("%%"), "every token must be consumed");
+  assertStringIncludes(html, "Amendments");
+  assertStringIncludes(html, "Birthday &amp; Anniversary Card (HCF-CARD) cancelled");
+  // Both reversal signatures are RECORDED (the cancel AND the withdraw), each an
+  // embedded verifiable JWS proof.
+  assertStringIncludes(html, "cancelled signature");
+  assertStringIncludes(html, "cashed out signature");
+  assertStringIncludes(html, "eyJhbGciOiJFZERTQQ.cancelpayload.cancelsig");
+  assertStringIncludes(html, "eyJhbGciOiJFZERTQQ.withdrawpayload.withdrawsig");
+  assertStringIncludes(html, "0x76f14ca5"); // shortened cash-out tx in the withdraw summary
+  assertStringIncludes(html, "verified");
+  assertStringIncludes(html, "-$3.25"); // the reversed line amount
+  // Net now = settlement 25.24 minus the 3.25 reversal = 21.99
+  assertStringIncludes(html, "Net now");
+  assertStringIncludes(html, "$21.99");
+});
+
+Deno.test("fillReceiptTemplate hides the Amendments section when there are no reversals", () => {
+  const html = fillReceiptTemplate(TEMPLATE, {
+    jws: makeJws(CLAIMS),
+    pubkeyX: "k",
+    merchant: { name: "m", host: "h" },
+  });
+  assert(!html.includes("%%"), "every token must be consumed");
+  assert(!html.includes("Amendments"), "no Amendments section without reversals");
+  assert(!html.includes("Net now"), "no Net-now line without reversals");
+});
+
+Deno.test("fillReceiptTemplate omits Net-now when a reversal has no amount", () => {
+  const html = fillReceiptTemplate(TEMPLATE, {
+    jws: makeJws(CLAIMS),
+    pubkeyX: "k",
+    merchant: { name: "m", host: "h" },
+    reversals: [{ kind: "cancel", exchange_id: "48" }],
+  });
+  assertStringIncludes(html, "Amendments");
+  assert(!html.includes("Net now"), "Net-now needs every reversal to carry an amount");
+});
+
 Deno.test("fillReceiptTemplate renders a fallback when there are no items", () => {
   const html = fillReceiptTemplate(TEMPLATE, { jws: makeJws(CLAIMS), pubkeyX: "k", merchant: { name: "m", host: "h" } });
   assertStringIncludes(html, "Line items are not available");
   assertStringIncludes(html, "<dt>Shipping</dt><dd>$9.00</dd>"); // breakdown still renders
+});
+
+Deno.test("seal + decoded sections render server-side for a no-JS viewer", () => {
+  // Offline-verified: the static seal reads Verified, not a stuck "Verifying",
+  // and the decoded header/payload are present without the page running any JS.
+  const verified = fillReceiptTemplate(TEMPLATE, {
+    jws: makeJws(CLAIMS),
+    pubkeyX: "PUBKEYX",
+    verified: true,
+    merchant: { name: "Pecan & Petal", host: "pecanandpetal.facet.llc" },
+  });
+  assertStringIncludes(verified, "stamp is-ok");
+  assertStringIncludes(verified, "<b>Verified</b>");
+  assertStringIncludes(verified, "offline against the merchant JWKS");
+  assertStringIncludes(verified, "facet-receipt+jws"); // decoded header
+  assertStringIncludes(verified, "ucp-origin:https://facet.llc"); // decoded payload
+  // The compact JWS spans and the JOSE reproduce snippet are baked in too, so a
+  // no-JS viewer shows them instead of two empty boxes.
+  assertStringIncludes(verified, '<span class="sh">'); // JWS header segment span
+  assertStringIncludes(verified, '<span class="ss">'); // JWS signature segment span
+  assertStringIncludes(verified, "compactVerify"); // JOSE snippet, server-rendered
+  assertStringIncludes(verified, "createLocalJWKSet");
+
+  // Not offline-verified (JWKS unreachable at render): the resting state stays the
+  // JS-driven "Verifying", which the embedded script resolves when it runs.
+  const unverified = fillReceiptTemplate(TEMPLATE, {
+    jws: makeJws(CLAIMS),
+    pubkeyX: null,
+    verified: false,
+    merchant: { name: "m", host: "h" },
+  });
+  assertStringIncludes(unverified, "stamp is-checking");
+  assertStringIncludes(unverified, "<b>Verifying</b>");
 });
 
 Deno.test("fillReceiptTemplate injects the JWS and pubkey script-safely", () => {

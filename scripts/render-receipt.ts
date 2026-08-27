@@ -15,6 +15,18 @@
 // The fetch-and-write orchestration lives in facet-checkout.ts's `render-receipt`
 // subcommand, which holds the receipt-fetch helpers.
 
+/** One recorded signed lifecycle (reversal) receipt: a compact Ed25519 JWS
+ *  (typ facet-lifecycle+jws) for a cancel / withdraw / dispute / refund, verifiable
+ *  offline against the merchant JWKS. Embedded in the receipt's Amendments section so
+ *  the reversal signatures travel with it, exactly as the settlement JWS does. */
+export type ReversalSignature = {
+  readonly kind: string;
+  readonly jws: string;
+  readonly kid?: string;
+  readonly tx_hash?: string;
+  readonly verified?: boolean | null;
+};
+
 export interface ReceiptRenderInput {
   /** The compact receipt JWS (header.payload.signature). */
   readonly jws: string;
@@ -22,6 +34,11 @@ export interface ReceiptRenderInput {
    *  null when the JWKS could not be fetched; the page then shows the offline
    *  verdict instead of an in-page check. */
   readonly pubkeyX: string | null;
+  /** The offline verification verdict computed at render time (verifyReceipt).
+   *  Sets the seal's STATIC resting state so a no-JS viewer (a sandboxed preview
+   *  that strips inline scripts) shows "Verified offline" rather than a stuck
+   *  "Verifying"; the embedded script upgrades it to the live in-browser check. */
+  readonly verified?: boolean | null;
   readonly merchant: { readonly name: string; readonly host: string; readonly location?: string };
   /** The client-side provenance block from a settle result, or null (a plain
    *  re-fetched receipt carries none, and the provenance section is omitted). */
@@ -42,6 +59,27 @@ export interface ReceiptRenderInput {
       readonly signatures?: ReadonlyArray<Record<string, unknown>>;
       readonly authorizations?: ReadonlyArray<Record<string, unknown>>;
     }
+    | null;
+  /** Post-settlement reversals for this order (per-line cancel, withdraw, dispute,
+   *  refund), rendered as an Amendments section with a Net-now line. The original
+   *  signed settlement above is never mutated: each reversal is its own signed
+   *  lifecycle receipt, so the page stays fully verifiable. Empty/absent hides the
+   *  section. `amount_minor` is the line's reversed amount (minor units) when known;
+   *  when every reversal carries one, Net-now = settlement minus their sum. */
+  readonly reversals?:
+    | ReadonlyArray<{
+      readonly kind: "cancel" | "withdraw" | "dispute" | "refund";
+      readonly exchange_id?: string;
+      readonly sku?: string;
+      readonly name?: string;
+      readonly amount_minor?: number;
+      /** Every signed lifecycle receipt recorded for this reversed line (the cancel
+       *  AND its withdraw, a merchant refund, etc.), each a compact Ed25519 JWS
+       *  (typ facet-lifecycle+jws) verifiable offline against the merchant JWKS. These
+       *  are recorded in the Amendments section so the reversal signatures travel with
+       *  the receipt, exactly as the settlement JWS does. */
+      readonly signatures?: ReadonlyArray<ReversalSignature>;
+    }>
     | null;
 }
 
@@ -136,6 +174,71 @@ function breakdownHtml(split: Record<string, unknown> | undefined, currency: str
     }
   }
   return parts.join("\n          ");
+}
+
+/** The Amendments section: post-settlement reversals for this order (one entry per
+ *  reversed LINE; the caller folds a cancel + its withdraw into a single line so the
+ *  amount is not double-counted), plus a Net-now line. The original signed settlement
+ *  above is never mutated. Each reversal is its own signed lifecycle receipt, so the
+ *  page stays fully verifiable. Returns "" (section hidden) when there are none.
+ *  Net-now renders ONLY when every reversal carries an amount, since a partial sum
+ *  would show a wrong total, which is worse than none. */
+function amendmentsHtml(
+  reversals: ReceiptRenderInput["reversals"],
+  settlementAmountMinor: unknown,
+  currency: string,
+): string {
+  const list = Array.isArray(reversals) ? reversals : [];
+  if (list.length === 0) return "";
+  const verb: Record<string, string> = {
+    cancel: "cancelled",
+    withdraw: "cashed out",
+    dispute: "disputed",
+    refund: "refunded",
+  };
+  const items = list
+    .map((r) => {
+      const label = r.name && r.name !== "" ? r.name : (r.sku ?? `exchange ${r.exchange_id ?? ""}`);
+      const skuPart = r.sku && r.name ? ` (${esc(r.sku)})` : "";
+      const act = verb[r.kind] ?? esc(r.kind);
+      const amt = typeof r.amount_minor === "number"
+        ? `<span class="rev-amt">-${esc(moneyMinor(r.amount_minor, currency))}</span>`
+        : "";
+      // The recorded signatures for this reversal (the cancel AND its withdraw, a
+      // merchant refund, etc.): each a compact JWS embedded in the page so the proof
+      // travels with the receipt and can be verified offline against the merchant JWKS.
+      const sigs: readonly ReversalSignature[] = r.signatures ?? [];
+      const sigHtml = sigs
+        .map((s) => {
+          const sVerb = verb[s.kind] ?? esc(s.kind);
+          const tx = s.tx_hash && s.tx_hash !== "" ? ` &#183; ${esc(shortHex(s.tx_hash))}` : "";
+          const ok = s.verified === true ? ` &#183; <span class="rev-ok">verified</span>` : "";
+          return `<details class="rev-sig">
+              <summary>${sVerb} signature${tx}${ok}</summary>
+              <code class="rev-jws">${esc(s.jws)}</code>
+            </details>`;
+        })
+        .join("\n            ");
+      const sigBlock = sigHtml !== "" ? `\n            ${sigHtml}` : "";
+      return `<li>
+          <div class="rev-row"><span class="rev-what">${esc(label)}${skuPart} ${act}</span>${amt}</div>${sigBlock}
+        </li>`;
+    })
+    .join("\n        ");
+  const total = Number(settlementAmountMinor);
+  const allAmounts = list.every((r) => typeof r.amount_minor === "number");
+  const sum = list.reduce((a, r) => a + (typeof r.amount_minor === "number" ? r.amount_minor : 0), 0);
+  const netRow = allAmounts && Number.isFinite(total)
+    ? `\n        <div class="net-now"><span>Net now</span><span>${
+      esc(moneyMinor(total - sum, currency))
+    }</span></div>`
+    : "";
+  return `<div class="amendments">
+        <h3 class="lbl">Amendments</h3>
+        <ul class="rev-list">
+        ${items}
+        </ul>${netRow}
+      </div>`;
 }
 
 /** The order items, resolved by the caller (name, sku, qty, and the paid line
@@ -358,7 +461,7 @@ function serverTrailSection(
  *  Pure: the template string in, the finished HTML out. Throws if the template is
  *  missing an expected token (a wrong or truncated template). */
 export function fillReceiptTemplate(template: string, input: ReceiptRenderInput): string {
-  const [hSeg, pSeg] = input.jws.split(".");
+  const [hSeg, pSeg, sSeg] = input.jws.split(".");
   const header = b64urlJson(hSeg ?? "");
   const claims = b64urlJson(pSeg ?? "");
   const st = (claims.settlement ?? {}) as Record<string, unknown>;
@@ -374,6 +477,7 @@ export function fillReceiptTemplate(template: string, input: ReceiptRenderInput)
     "%%CHIPS%%": chipsHtml(st),
     "%%ITEMS%%": itemsHtml(input.items, currency),
     "%%BREAKDOWN%%": breakdownHtml(claims.split as Record<string, unknown> | undefined, currency),
+    "%%AMENDMENTS%%": amendmentsHtml(input.reversals, st.amount_minor, currency),
     "%%PROVENANCE%%": provenanceSection(input.provenance),
     "%%SETTLEMENT_KV%%": settlementKv(claims, st),
     "%%SIGNEDBY_KV%%": signedbyKv(claims, header, jwksUrl),
@@ -385,6 +489,33 @@ export function fillReceiptTemplate(template: string, input: ReceiptRenderInput)
     "%%MERCHANT_HOST%%": esc(hostOf(iss)),
     "%%JWS%%": scriptJson(input.jws),
     "%%PUBKEY_X%%": scriptJson(input.pubkeyX),
+    // Server-rendered so the decoded header/payload show even when the viewer
+    // strips inline scripts (a sandboxed preview); the embedded script overwrites
+    // them with the same content when it runs.
+    "%%HDR_JSON%%": esc(JSON.stringify(header, null, 2)),
+    "%%CLAIMS_JSON%%": esc(JSON.stringify(claims, null, 2)),
+    // The seal's static resting state from the render-time offline verdict. JS
+    // upgrades it to the live in-browser Ed25519 check, or flips it to Invalid.
+    "%%SEAL_CLASS%%": input.verified === true ? "stamp is-ok" : "stamp is-checking",
+    "%%SEAL_WORD%%": input.verified === true ? "Verified" : "Verifying",
+    "%%SEAL_STATUS%%": input.verified === true
+      ? "offline against the merchant JWKS"
+      : "Ed25519, in your browser",
+    // Server-rendered so the compact JWS and the JOSE reproduce snippet show even
+    // in a no-JS viewer, symmetric with the decoded header/payload above; the
+    // inline script overwrites both with the same content when it runs.
+    "%%JWS_SPANS%%": `<span class="sh">${esc(hSeg ?? "")}</span><span class="dt">.</span>` +
+      `<span class="sp">${esc(pSeg ?? "")}</span><span class="dt">.</span>` +
+      `<span class="ss">${esc(sSeg ?? "")}</span>`,
+    "%%SNIPPET%%": esc(
+      `import { compactVerify, createLocalJWKSet } from "jose";\n\n` +
+        `const origin = ${JSON.stringify(iss || "")};\n` +
+        `const jwks = await (await fetch(origin + "/.well-known/jwks.json")).json();\n` +
+        `const { payload } = await compactVerify(jws, createLocalJWKSet(jwks));\n\n` +
+        `// throws unless typ = facet-receipt+jws, alg = EdDSA,\n` +
+        `// iss = the origin you transacted with, and the signature checks out.\n` +
+        `console.log("verified:", JSON.parse(new TextDecoder().decode(payload)));`,
+    ),
   };
 
   let html = template;

@@ -59,7 +59,10 @@
   b{font-weight:600}
   .top{display:flex; justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap}
   .top-l{display:flex; align-items:center; gap:14px; min-width:0}
-  .brandmark{height:44px; width:auto; display:block; flex:none}
+  .brandmark{height:72px; width:auto; display:block; flex:none}
+  .brandmark .blink{animation:fblink 1.1s step-end infinite}
+  @keyframes fblink{50%{opacity:0}}
+  @media (prefers-reduced-motion: reduce){.brandmark .blink{animation:none}}
   .lm{display:none}
   :root.light .dm{display:none}
   :root.light .lm{display:block}
@@ -91,6 +94,17 @@
   .breakdown{display:grid; grid-template-columns:max-content max-content; gap:9px 26px; width:fit-content}
   .breakdown dt{font-size:.8rem; color:var(--ink-3)}
   .breakdown dd{margin:0; font-size:.8rem; color:var(--ink); font-weight:500; text-align:right; font-variant-numeric:tabular-nums}
+  .amendments{margin-top:16px; padding-top:16px; border-top:1px solid var(--border)}
+  .amendments .lbl{margin-bottom:12px}
+  .rev-list{list-style:none; margin:0; padding:0; display:grid; gap:12px}
+  .rev-row{display:flex; justify-content:space-between; gap:16px; align-items:baseline}
+  .rev-what{font-size:.85rem; color:var(--ink)}
+  .rev-amt{font-size:.85rem; font-weight:600; font-variant-numeric:tabular-nums; white-space:nowrap}
+  .rev-sig{margin-top:6px}
+  .rev-sig summary{font-size:.75rem; color:var(--ink-3); cursor:pointer}
+  .rev-jws{display:block; margin-top:6px; padding:8px 10px; font-size:.68rem; line-height:1.5; word-break:break-all; color:var(--ink-3); background:rgba(127,127,127,.08); border-radius:6px; max-height:150px; overflow:auto}
+  .net-now{display:flex; justify-content:space-between; margin-top:12px; padding-top:12px; border-top:1px solid var(--border); font-weight:700; color:var(--ink)}
+  .rev-ok{color:#3fb950; font-weight:600}
   .items{min-width:0}
   .item{display:flex; gap:11px; align-items:baseline}
   .item + .item{margin-top:11px; padding-top:11px; border-top:1px solid var(--border)}
@@ -168,10 +182,10 @@
 <main class="doc">
   <div class="pad top">
     <div class="top-l">
-      <svg class="brandmark dm" viewBox="0 0 256.41 256.82" role="img" aria-label="Facet">
+      <svg class="brandmark dm" viewBox="44 4 173 217" role="img" aria-label="Facet">
         <polygon points="56.87 122.32 55.77 51.07 60.22 48.68 126.68 88.02 126.68 159.73 122.93 161.73 56.87 122.32" fill="#262626" stroke="#141414" stroke-miterlimit="10"/>
         <path d="M69.2,88.62c-1.04-.05-2.33-1.77-2.18-2.52.06-.33.59-.76.93-.97l2.75-1.74c.66-.42,1.26-.97,1.75-1.71l-5.03-9.4c-.14-.26-.28-.84-.26-1.1.02-.31.78-.8,1.08-.69.85.3,1.45,1.37,1.86,2.13l3.61,6.64c1.68,3.09,3.27,4.45,1.15,5.79l-5.66,3.57Z" fill="#489c72"/>
-        <path d="M88.48,96.61c1.37.78,2.13,1.75,1.93,3-.05.3-.65.69-1,.68l-10.32-6.01c-.63-.37-1.22-.96-1.3-1.45-.11-.66.07-1.58.57-1.99l3.28,1.83,6.84,3.92Z" fill="#489c72"/>
+        <path d="M88.48,96.61c1.37.78,2.13,1.75,1.93,3-.05.3-.65.69-1,.68l-10.32-6.01c-.63-.37-1.22-.96-1.3-1.45-.11-.66.07-1.58.57-1.99l3.28,1.83,6.84,3.92Z" class="blink" fill="#489c72"/>
         <polygon points="67.01 44.79 134.8 7.16 199.61 44.79 133.41 83.61 67.01 44.79" fill="#ffffff"/>
         <polygon points="199.61 44.79 199.61 119.75 133.41 157.38 133.41 83.61 199.61 44.79" fill="#7c7c7c"/>
         <g fill="#ffffff">
@@ -182,10 +196,10 @@
           <path d="M132.69,211.17c2.51-.68,4.02-2.4,4.18-5.04h7.24c-.04,1.26-.22,2.43-.57,3.61-.72,2.32-2.16,4.26-4.16,5.65-3.36,2.39-8.1,2.84-12.09,2.18-4.85-.8-8.84-3.93-10.04-8.76-.26-1.06-.43-2.08-.43-3.19v-9.05c0-1.28.21-2.46.56-3.67,1.3-4.4,5-7.34,9.46-8.19,4.31-.82,9.52-.33,13.04,2.47,2.82,2.21,4.13,5.26,4.24,8.88h-7.24c-.16-2.55-1.6-4.22-3.96-4.97-3-.79-6.75-.2-8.14,2.8-.39.84-.61,1.73-.61,2.69v8.92c0,.69.12,1.33.3,1.98.51,1.78,1.89,3.11,3.67,3.63,1.48.43,3.01.43,4.55.08h0Z"/>
         </g>
       </svg>
-      <svg class="brandmark lm" viewBox="0 0 256.41 256.82" role="img" aria-label="Facet">
+      <svg class="brandmark lm" viewBox="44 4 173 217" role="img" aria-label="Facet">
         <polygon points="56.87 122.32 55.77 51.07 60.22 48.68 126.68 88.02 126.68 159.73 122.93 161.73 56.87 122.32" fill="#202020" stroke="#141414" stroke-miterlimit="10"/>
         <path d="M69.2,88.62c-1.04-.05-2.33-1.77-2.18-2.52.06-.33.59-.76.93-.97l2.75-1.74c.66-.42,1.26-.97,1.75-1.71l-5.03-9.4c-.14-.26-.28-.84-.26-1.1.02-.31.78-.8,1.08-.69.85.3,1.45,1.37,1.86,2.13l3.61,6.64c1.68,3.09,3.27,4.45,1.15,5.79l-5.66,3.57Z" fill="#489c72"/>
-        <path d="M88.48,96.61c1.37.78,2.13,1.75,1.93,3-.05.3-.65.69-1,.68l-10.32-6.01c-.63-.37-1.22-.96-1.3-1.45-.11-.66.07-1.58.57-1.99l3.28,1.83,6.84,3.92v.02Z" fill="#489c72"/>
+        <path d="M88.48,96.61c1.37.78,2.13,1.75,1.93,3-.05.3-.65.69-1,.68l-10.32-6.01c-.63-.37-1.22-.96-1.3-1.45-.11-.66.07-1.58.57-1.99l3.28,1.83,6.84,3.92v.02Z" class="blink" fill="#489c72"/>
         <polygon points="67.01 44.79 134.8 7.16 199.61 44.79 133.41 83.61 67.01 44.79" fill="#e2e2e2"/>
         <polygon points="199.61 44.79 199.61 119.75 133.41 157.38 133.41 83.61 199.61 44.79" fill="#8c8c8c"/>
         <g fill="#202020">
@@ -201,13 +215,13 @@
         <div class="s">Signed ledger record</div>
       </div>
     </div>
-    <div class="stamp is-checking" id="verify">
+    <div class="%%SEAL_CLASS%%" id="verify">
       <svg class="stamp-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <circle cx="12" cy="12" r="10" stroke-width="1.6" opacity=".5"></circle>
         <path class="chk" d="M8 12.4l2.6 2.6L16 9"></path>
         <path class="brk" d="M9 9l6 6M15 9l-6 6"></path>
       </svg>
-      <div class="stamp-tx"><b id="vword">Verifying</b><span id="vstatus">Ed25519, in your browser</span></div>
+      <div class="stamp-tx"><b id="vword">%%SEAL_WORD%%</b><span id="vstatus">%%SEAL_STATUS%%</span></div>
     </div>
   </div>
 
@@ -230,6 +244,7 @@
         </dl>
       </div>
     </div>
+    %%AMENDMENTS%%
   </div>
 
   %%LEDGER%%
@@ -259,16 +274,16 @@
       <div class="pad div">
         <div class="box">
           <div class="box-h"><span class="t">Compact JWS &#183; header.payload.signature</span><button class="copy" id="copyJws" type="button">Copy</button></div>
-          <div class="box-b"><code id="jwsOut"></code></div>
+          <div class="box-b"><code id="jwsOut">%%JWS_SPANS%%</code></div>
         </div>
         <div class="decoded">
-          <div><p class="cap">Decoded header</p><pre><code id="hdrOut"></code></pre></div>
-          <div><p class="cap">Decoded payload</p><pre><code id="claimsOut"></code></pre></div>
+          <div><p class="cap">Decoded header</p><pre><code id="hdrOut">%%HDR_JSON%%</code></pre></div>
+          <div><p class="cap">Decoded payload</p><pre><code id="claimsOut">%%CLAIMS_JSON%%</code></pre></div>
         </div>
         <p class="note"><b>Verify it anywhere.</b> Take the JWS, fetch the issuer's published keys, select the key by <b>kid</b>, and check the Ed25519 signature. No call back to Facet, only the merchant's public keys.</p>
         <div class="box snip">
           <div class="box-h"><span class="t">Reproduce with any JOSE library</span></div>
-          <div class="box-b"><code id="snippet"></code></div>
+          <div class="box-b"><code id="snippet">%%SNIPPET%%</code></div>
         </div>
       </div>
     </div>
@@ -337,8 +352,8 @@ console.log("verified:", JSON.parse(new TextDecoder().decode(payload)));`;
         const key = await crypto.subtle.importKey('jwk', { kty:'OKP', crv:'Ed25519', x:PUBKEY_X }, { name:'Ed25519' }, false, ['verify']);
         const ok = await crypto.subtle.verify({ name:'Ed25519' }, key, b64url(s), new TextEncoder().encode(h + '.' + p));
         box.classList.remove('is-checking');
-        if (ok) { box.classList.add('is-ok'); vword.textContent = 'Verified'; vstatus.textContent = 'Ed25519, in your browser'; }
-        else { box.classList.add('is-fail'); vword.textContent = 'Invalid'; vstatus.textContent = 'signature did not verify'; }
+        if (ok) { box.classList.remove('is-fail'); box.classList.add('is-ok'); vword.textContent = 'Verified'; vstatus.textContent = 'Ed25519, in your browser'; }
+        else { box.classList.remove('is-ok'); box.classList.add('is-fail'); vword.textContent = 'Invalid'; vstatus.textContent = 'signature did not verify'; }
       } catch (e) {
         box.classList.remove('is-checking'); box.classList.add('is-ok');
         vword.textContent = 'Verified'; vstatus.textContent = 'offline, by the Facet client';

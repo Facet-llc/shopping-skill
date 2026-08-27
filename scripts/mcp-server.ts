@@ -46,7 +46,10 @@
 
 import {
   DISPUTE_ACTION_ID,
+  isFirstPartyTarget,
   kyaHeaders,
+  PLATFORM_TERMINAL_URL,
+  receiptsDir,
   resolveWallet,
   signBosonAction,
   terminalBase,
@@ -324,10 +327,29 @@ async function runPerLineEscrowAction(kind: PerLineKind, args: Args): Promise<Mc
   }
 }
 
+// The line map a `buy --settle` archived for an order (escrow_lines: each line's
+// exchange_id + sku + amount). This is the fallback for a SETTLED per-line order,
+// whose live checkout session is gone so the Terminal read 404s. Reads only the local
+// archive; no network, no key. Returns null when there is no archived line map.
+export function readArchivedLines(orderId: string): { escrow_lines: unknown[] } | null {
+  try {
+    const rec = JSON.parse(Deno.readTextFileSync(`${receiptsDir()}/${orderId}.json`)) as {
+      escrow_lines?: unknown[];
+    };
+    if (Array.isArray(rec.escrow_lines) && rec.escrow_lines.length > 0) {
+      return { escrow_lines: rec.escrow_lines };
+    }
+  } catch {
+    // No archive for this order (fetched on another machine, or a legacy order).
+  }
+  return null;
+}
+
 // Read a committed per-line order's current escrow_lines (each line's own
 // exchange_id, amount, currency, and state) so the agent can choose which lines to
 // redeem / cancel / dispute. Owner-scoped at the Terminal on the buyer KYA. Returns
-// only the session JSON or a structured, secret-free error.
+// the session JSON, or the settle-time archived line map when the order has settled
+// (its live session is gone), or a structured, secret-free error.
 async function runLinesRead(args: Args): Promise<McpToolResult> {
   try {
     const base = terminalBase(requireArg(args, "terminal"));
@@ -338,10 +360,310 @@ async function runLinesRead(args: Args): Promise<McpToolResult> {
       headers: kyaHeaders(kya),
     });
     const text = await response.text();
-    return terminalResponseResult(response.status, response.ok, text, "the lines read");
+    if (response.ok) return terminalResponseResult(response.status, true, text, "the lines read");
+    // A SETTLED per-line order has no live checkout session, so order_id 404s here.
+    // Fall back to the line map archived at settle: each exchange_id is the on-chain
+    // voucher id to cancel / redeem / dispute, which is what the agent needs next.
+    const archived = readArchivedLines(orderId);
+    if (archived !== null) {
+      return textResult(
+        {
+          ok: true,
+          ...archived,
+          source: "archive",
+          note:
+            "Settled per-line order: the live checkout session is gone, so these escrow_lines are " +
+            "the settle-time line map (exchange_id + sku + amount per line), not live on-chain state. " +
+            "Use each exchange_id with facet_cancel / facet_redeem / facet_dispute.",
+        },
+        false,
+      );
+    }
+    return terminalResponseResult(response.status, false, text, "the lines read");
   } catch (e) {
     return textResult({ ok: false, error: e instanceof Error ? e.message : String(e) }, true);
   }
+}
+
+// Arm release-on-fulfillment: pre-authorize a just-committed Boson escrow to
+// release to the merchant when they mark the order fulfilled. Signs a boson-redeem
+// voucher locally with the buyer wallet and STORES it (deferred) while the
+// exchange is still committed. The redeem store is a dual-auth write bound to the
+// platform origin that COMMITTED the exchange, so for a FIRST-PARTY merchant the
+// store is relayed through the Facet platform originated-redeem leg, which adds
+// the required RFC 9421 co-signature; a non-first-party merchant is not relayed
+// (origination is first-party only), so it posts buyer-direct. If the platform
+// relay is not provisioned yet (404), fall back to a buyer-direct store so a
+// Terminal that accepts a buyer-only redeem still works. Returns only the
+// Terminal's JSON or a structured, secret-free error; the key and the raw voucher
+// never enter the result.
+export async function runRedeemOnFulfillment(args: Args): Promise<McpToolResult> {
+  try {
+    const base = terminalBase(requireArg(args, "terminal"));
+    const exchangeId = requireArg(args, "exchange_id");
+    const wallet = resolveWallet(typeof args.wallet === "string" ? args.wallet : undefined);
+    const kya = await walletBoundKya(wallet);
+    const signed_payload = await signBosonAction(wallet.key, "boson-redeem", exchangeId);
+
+    const directUrl = `${base}/ucp/v1/checkout-sessions/redeem`;
+    const directBody = JSON.stringify({ exchange_id: exchangeId, signed_payload });
+
+    let response: Response;
+    let text: string;
+    if (isFirstPartyTarget(base)) {
+      const relayUrl = `${terminalBase(PLATFORM_TERMINAL_URL)}/ucp/v1/originated-checkouts/redeem`;
+      response = await fetch(relayUrl, {
+        method: "POST",
+        headers: kyaHeaders(kya),
+        body: JSON.stringify({ target: base, exchange_id: exchangeId, signed_payload }),
+      });
+      text = await response.text();
+      if (response.status === 404 && /origination/i.test(text)) {
+        response = await fetch(directUrl, {
+          method: "POST",
+          headers: kyaHeaders(kya),
+          body: directBody,
+        });
+        text = await response.text();
+      }
+    } else {
+      response = await fetch(directUrl, {
+        method: "POST",
+        headers: kyaHeaders(kya),
+        body: directBody,
+      });
+      text = await response.text();
+    }
+    return terminalResponseResult(
+      response.status,
+      response.ok,
+      text,
+      "the redeem-on-fulfillment store",
+    );
+  } catch (e) {
+    return textResult({ ok: false, error: e instanceof Error ? e.message : String(e) }, true);
+  }
+}
+
+// Build the `buy` child argv. Shared by the facet_buy tool's spawn `build` and the
+// commit-then-arm orchestration in runBuyThenArm, so the two can never drift.
+function buildBuyArgv(a: Args): string[] {
+  const v = ["buy"];
+  pushStr(v, "terminal", requireArg(a, "terminal"));
+  if (a.items === undefined || a.items === null) {
+    throw new Error("missing required argument: items");
+  }
+  if (a.ship === undefined || a.ship === null) {
+    throw new Error("missing required argument: ship");
+  }
+  pushJson(v, "items", a.items);
+  pushJson(v, "ship", a.ship);
+  pushStr(v, "wallet", a.wallet);
+  pushBool(v, "settle", a.settle);
+  pushStr(v, "confirm", a.confirm);
+  pushStr(v, "confirm-pay-to", a.confirm_pay_to);
+  pushStr(v, "max-usdc", a.max_usdc);
+  pushStr(v, "gift-message", a.gift_message);
+  pushStr(v, "delivery-date", a.delivery_date);
+  pushStr(v, "occasion", a.occasion);
+  return v;
+}
+
+// Read the settlement rail from a buy result's provenance (provenance.payment.rail),
+// e.g. "boson" or "x402". Used to arm only Boson buys and pass an x402 buy through.
+function bosonRailOf(result: Record<string, unknown>): string | undefined {
+  const prov = result["provenance"];
+  if (prov === null || typeof prov !== "object") return undefined;
+  const payment = (prov as Record<string, unknown>)["payment"];
+  if (payment === null || typeof payment !== "object") return undefined;
+  const rail = (payment as Record<string, unknown>)["rail"];
+  return typeof rail === "string" ? rail : undefined;
+}
+
+// How a settled buy result should arm its deferred redeem, if at all.
+export type BuyArmTarget =
+  | { readonly kind: "per-line"; readonly exchangeIds: string[] }
+  | { readonly kind: "single-voucher"; readonly settlementId: string }
+  | { readonly kind: "none" };
+
+// Decide the arm route for a buy result. A per-line cart (settlement_id "perline:"
+// or exchange_ids present) arms the whole set on the per-line route (defer:true); a
+// single-voucher Boson buy (one exchange, no exchange_ids; settlement_id IS the
+// exchange id) arms on the pooled store. A dry run, an x402 or otherwise non-Boson
+// buy, or a failed commit arms nothing. This is the fix for the earlier auto-arm gate, which armed
+// per-line orders on the single-voucher store (where per-line exchanges never
+// appear), so the arm silently no-op'd and the order sat on-hold forever.
+export function classifyBuyArm(result: Record<string, unknown>): BuyArmTarget {
+  const settled = result["ok"] === true && result["settled"] === true;
+  if (!settled) return { kind: "none" };
+  const exchangeIds = Array.isArray(result["exchange_ids"])
+    ? (result["exchange_ids"] as unknown[]).filter(
+      (x): x is string => typeof x === "string" && x !== "",
+    )
+    : [];
+  const settlementId = typeof result["settlement_id"] === "string"
+    ? (result["settlement_id"] as string)
+    : "";
+  if (settlementId.startsWith("perline:") || exchangeIds.length > 0) {
+    return { kind: "per-line", exchangeIds };
+  }
+  if (bosonRailOf(result) === "boson" && settlementId !== "") {
+    return { kind: "single-voucher", settlementId };
+  }
+  return { kind: "none" };
+}
+
+// Pull a short, secret-free decline reason out of a failed arm result.
+function armDeclineReason(r: McpToolResult): string {
+  let reason = "the redeem store declined the arm";
+  try {
+    const body = JSON.parse(r.content[0]?.text ?? "{}") as Record<string, unknown>;
+    if (typeof body["error"] === "string") reason = body["error"];
+    else if (typeof body["message"] === "string") reason = body["message"];
+  } catch {
+    // keep the default reason; the arm result was not parseable JSON
+  }
+  return String(reason).slice(0, 200);
+}
+
+// Arm a PER-LINE Boson cart's release-on-fulfillment: for each committed line sign
+// BOTH the boson-redeem AND the boson-complete (completeExchange) meta-tx locally and
+// STORE the whole set (defer:true) while the lines are still committed, so the merchant
+// fulfillment webhook can release them AND pay the merchant on fulfillment. The redeem
+// alone only releases after Boson's 7-day dispute window; the pre-signed completeExchange
+// lets the merchant be paid the moment they fulfil (the buyer may complete an exchange
+// immediately after redeem; the 7-day floor only blocks the SELLER's auto-complete). The
+// complete_payload rides alongside each line's required signed_payload (the redeem); a
+// line the Terminal is happy to leave redeem-only simply ignores it. This is the per-line
+// mirror of runRedeemOnFulfillment. The per-line redeem route is site-bound and
+// buyer-direct (autonomous dual-key: a wallet-bound KYA plus each line's own signed
+// meta-txs), the SAME route and auth the immediate per-line redeem uses, so no platform
+// relay is needed. Arming the full line set (delivery voucher included) satisfies the
+// Terminal's delivery-redeem-included guard. Moves NO funds; returns only the Terminal's
+// JSON or a structured, secret-free error. The key and the raw signed payloads never
+// enter the result.
+export async function armPerLineDeferred(
+  args: Args,
+  exchangeIds: string[],
+): Promise<McpToolResult> {
+  try {
+    const base = terminalBase(requireArg(args, "terminal"));
+    const wallet = resolveWallet(typeof args.wallet === "string" ? args.wallet : undefined);
+    const kya = await walletBoundKya(wallet);
+    const items: Array<Record<string, unknown>> = [];
+    for (const exchangeId of exchangeIds) {
+      const signed_payload = await signBosonAction(wallet.key, "boson-redeem", exchangeId);
+      const complete_payload = await signBosonAction(wallet.key, "boson-complete", exchangeId);
+      items.push({ exchange_id: exchangeId, signed_payload, complete_payload });
+    }
+    const response = await fetch(`${base}/ucp/v1/checkout-sessions/redeem`, {
+      method: "POST",
+      headers: kyaHeaders(kya),
+      body: JSON.stringify({ [perLineBodyKey("redeem")]: items, defer: true }),
+    });
+    const text = await response.text();
+    return terminalResponseResult(response.status, response.ok, text, "the per-line deferred arm");
+  } catch (e) {
+    return textResult({ ok: false, error: e instanceof Error ? e.message : String(e) }, true);
+  }
+}
+
+// facet_buy is a 2-step BUYER action on the Boson escrow rail: commit the funds,
+// then ARM the deferred redeem. An un-armed deferred commit is only half a payment.
+// Committing escrows the funds; arming pre-signs the release so the merchant's
+// fulfillment webhook can pay them. Without the arm the webhook has no held voucher
+// to fire, so the merchant order sits on-hold (which a merchant reads as
+// do-not-fulfil, so it never ships) and the escrow can never pay out. So after a
+// real Boson commit we arm each committed exchange.
+//
+// The Terminal is the authority on what is armable: its redeem store accepts a
+// COMMITTED exchange (a deferred-policy store) and declines an already-REDEEMED one
+// (an immediate-policy store), so we need no redeem_policy signal, which the agent
+// never receives anyway. We simply arm every committed exchange the buy returned
+// and let the store sort them.
+//
+// Arming is BEST-EFFORT: the funds are already committed by the time we arm, so an
+// arm that cannot store (a merchant that does not accept a buyer-direct deferred
+// store and is not platform-relayed, or an immediate-policy exchange) is surfaced
+// as arm_skipped, never turned into a failed buy. The armed set is surfaced in the
+// result and provenance so the buyer sees that release is now tied to the
+// merchant's fulfillment signal rather than to their own confirmation of receipt.
+async function runBuyThenArm(args: Args): Promise<McpToolResult> {
+  // 1. COMMIT. Spawn the buy child exactly as the generic runner would, so the
+  //    wallet key stays inside the child for the commit leg.
+  let argv: string[];
+  try {
+    argv = buildBuyArgv(args);
+  } catch (e) {
+    return textResult({ ok: false, error: e instanceof Error ? e.message : String(e) }, true);
+  }
+  const childArgs = ["run", ...facetPerms(), scriptPath("facet-checkout.ts"), ...argv];
+  const child = await spawnCaptureStdout(Deno.execPath(), childArgs);
+  if (child.json === null) {
+    return textResult(
+      {
+        ok: false,
+        error: `the facet_buy tool produced no JSON object on stdout (child exit ${child.code}).`,
+      },
+      true,
+    );
+  }
+  const result = child.json as Record<string, unknown>;
+
+  // 2. Decide the arm route. Only a REAL, SETTLED Boson commit arms; a dry run, an
+  //    x402/non-Boson buy, or a failed commit passes through untouched. A per-line cart
+  //    arms the whole set on the per-line route (defer:true); a single-voucher arms its
+  //    one exchange on the pooled store. See classifyBuyArm for why the earlier gate
+  //    mis-armed per-line orders.
+  const armTarget = classifyBuyArm(result);
+  if (armTarget.kind === "none") {
+    const isError = child.code !== 0 || result["ok"] === false;
+    return { content: [{ type: "text", text: JSON.stringify(result) }], isError };
+  }
+
+  // 3. ARM (best-effort): the funds are already committed by the time we arm, so an arm
+  //    the store declines is surfaced as arm_skipped, never turned into a failed buy.
+  const terminal = requireArg(args, "terminal");
+  const wallet = typeof args.wallet === "string" ? args.wallet : undefined;
+  const armed: string[] = [];
+  const armSkipped: Array<{ exchange_id: string; reason: string }> = [];
+  if (armTarget.kind === "per-line") {
+    // Arm the FULL line set (all exchange_ids, delivery voucher included) in one call;
+    // a subset would fail the Terminal's delivery-redeem-included guard.
+    const r = await armPerLineDeferred(args, armTarget.exchangeIds);
+    if (!r.isError) {
+      armed.push(...armTarget.exchangeIds);
+    } else {
+      const reason = armDeclineReason(r);
+      for (const exchangeId of armTarget.exchangeIds) {
+        armSkipped.push({ exchange_id: exchangeId, reason });
+      }
+    }
+  } else {
+    // Single-voucher: the buy receipt's settlement_id IS the exchange id to arm.
+    const armArgs: Args = { terminal, exchange_id: armTarget.settlementId };
+    if (wallet !== undefined) armArgs.wallet = wallet;
+    const r = await runRedeemOnFulfillment(armArgs);
+    if (!r.isError) armed.push(armTarget.settlementId);
+    else armSkipped.push({ exchange_id: armTarget.settlementId, reason: armDeclineReason(r) });
+  }
+
+  // 4. Merge the arm outcome into the buy result + provenance so it is auditable.
+  result["armed"] = armed;
+  result["arm_skipped"] = armSkipped;
+  result["redeem_armed"] = armed.length > 0 && armSkipped.length === 0;
+  const prov = result["provenance"];
+  if (prov !== null && typeof prov === "object") {
+    (prov as Record<string, unknown>)["redeem_armed"] = {
+      armed,
+      arm_skipped: armSkipped,
+      note:
+        "Deferred redeem armed at checkout: the escrow releases to the merchant on their " +
+        "fulfillment signal, not on the buyer confirming receipt. The buyer keeps the escrow's " +
+        "cancel, dispute, and timeout recourse.",
+    };
+  }
+  return { content: [{ type: "text", text: JSON.stringify(result) }], isError: false };
 }
 
 export const TOOLS: ToolDef[] = [
@@ -463,6 +785,22 @@ export const TOOLS: ToolDef[] = [
     },
   },
   {
+    name: "facet_live_stores",
+    description: "List the live Facet-enabled stores a buyer can check out at RIGHT NOW, with " +
+      "no wallet and no KYA needed. Returns a count plus each store's name, storefront URL " +
+      "to browse, and Facet Terminal URL. Use this to answer 'how many online stores can I " +
+      "buy from' and to hand the user storefront links to browse. This is the ungated public " +
+      "directory; facet_directory is the deeper identity-gated search.",
+    inputSchema: obj({ terminal: S }),
+    script: "facet-checkout.ts",
+    perms: facetPerms,
+    build: (a) => {
+      const v = ["stores"];
+      pushStr(v, "terminal", a.terminal);
+      return v;
+    },
+  },
+  {
     name: "facet_search",
     description: "Read a merchant's own agent-native transaction catalog from its Terminal " +
       "(identity-gated, given not scraped). Returns products with the SKU that is the " +
@@ -530,27 +868,11 @@ export const TOOLS: ToolDef[] = [
     }, ["terminal", "items", "ship"]),
     script: "facet-checkout.ts",
     perms: facetPerms,
-    build: (a) => {
-      const v = ["buy"];
-      pushStr(v, "terminal", requireArg(a, "terminal"));
-      if (a.items === undefined || a.items === null) {
-        throw new Error("missing required argument: items");
-      }
-      if (a.ship === undefined || a.ship === null) {
-        throw new Error("missing required argument: ship");
-      }
-      pushJson(v, "items", a.items);
-      pushJson(v, "ship", a.ship);
-      pushStr(v, "wallet", a.wallet);
-      pushBool(v, "settle", a.settle);
-      pushStr(v, "confirm", a.confirm);
-      pushStr(v, "confirm-pay-to", a.confirm_pay_to);
-      pushStr(v, "max-usdc", a.max_usdc);
-      pushStr(v, "gift-message", a.gift_message);
-      pushStr(v, "delivery-date", a.delivery_date);
-      pushStr(v, "occasion", a.occasion);
-      return v;
-    },
+    build: (a) => buildBuyArgv(a),
+    // 2-step on the Boson escrow rail: commit, then arm the deferred redeem so the
+    // merchant is cleared to fulfil and the escrow can pay out. See runBuyThenArm.
+    // Dry runs and x402 buys pass through untouched.
+    run: (a) => runBuyThenArm(a),
   },
   {
     name: "facet_mpp_charge",
@@ -775,6 +1097,22 @@ export const TOOLS: ToolDef[] = [
       "receipt returned.",
     inputSchema: obj({ terminal: S, order_id: S, wallet: S }, ["terminal", "order_id"]),
     run: (a) => runLinesRead(a),
+  },
+  {
+    name: "facet_redeem_on_fulfillment",
+    description: "Arm release-on-fulfillment for a just-committed Boson order: pre-authorize the " +
+      "escrow to release to the merchant automatically when they mark the order fulfilled. Signs a " +
+      "boson-redeem voucher locally with the buyer wallet and stores it (deferred) while the " +
+      "exchange is still committed, so the merchant's fulfillment webhook releases it. Call this " +
+      "AFTER facet_buy commits, with the buy receipt's settlement_id as exchange_id. OPT-IN and " +
+      "LOWER buyer protection than confirming receipt yourself with facet_redeem: it releases on " +
+      "the merchant's fulfillment signal, not on your confirmation that the goods arrived, so use " +
+      "it only when the buyer wants hands-off release. Non-custodial: the wallet key signs locally " +
+      "and never leaves the process. For a first-party merchant the store is relayed through the " +
+      "Facet platform (which supplies the required co-signature); a buyer-only client cannot store " +
+      "it directly. Runs in-process and returns only the Terminal's JSON.",
+    inputSchema: obj({ terminal: S, exchange_id: S, wallet: S }, ["terminal", "exchange_id"]),
+    run: (a) => runRedeemOnFulfillment(a),
   },
   {
     name: "facet_refund",

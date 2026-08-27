@@ -10,11 +10,16 @@
 
 import { assert, assertEquals, assertStringIncludes } from "jsr:@std/assert@^1";
 import {
+  armPerLineDeferred,
+  type BuyArmTarget,
+  classifyBuyArm,
   executeTool,
   handleMessage,
   normalizeExchangeIds,
   perLineBodyKey,
   planPerLineEscrowAction,
+  readArchivedLines,
+  runRedeemOnFulfillment,
   spawnCaptureStdout,
   TOOLS,
 } from "./mcp-server.ts";
@@ -27,6 +32,7 @@ const EXPECTED_TOOLS = [
   "facet_provision",
   "facet_discover",
   "facet_directory",
+  "facet_live_stores",
   "facet_search",
   "facet_product",
   "facet_buy",
@@ -38,6 +44,7 @@ const EXPECTED_TOOLS = [
   "facet_withdraw",
   "facet_dispute",
   "facet_lines",
+  "facet_redeem_on_fulfillment",
   "facet_refund",
   "facet_resolve",
   "facet_reorder",
@@ -238,6 +245,49 @@ Deno.test("tool table is internally consistent", () => {
     const hasDash = [...t.description].some((c) => DASHES.includes(c));
     assert(!hasDash, `tool ${t.name} description has a dash`);
   }
+});
+
+Deno.test("facet_live_stores builds the public stores subcommand argv", () => {
+  const tool = TOOLS.find((t) => t.name === "facet_live_stores");
+  assert(tool !== undefined, "facet_live_stores is not registered");
+  // With an explicit terminal override.
+  assertEquals(tool.build!({ terminal: "https://api.facet.llc" }), [
+    "stores",
+    "--terminal",
+    "https://api.facet.llc",
+  ]);
+  // No args: the CLI defaults to the platform terminal, so argv is bare.
+  assertEquals(tool.build!({}), ["stores"]);
+});
+
+Deno.test("facet_buy builds the buy argv and is wired as a commit-then-arm 2-step", () => {
+  const tool = TOOLS.find((t) => t.name === "facet_buy");
+  assert(tool !== undefined, "facet_buy is not registered");
+  // The extracted buildBuyArgv must still produce the exact buy argv (regression
+  // guard against drift now that build and runBuyThenArm share it).
+  const argv = tool.build!({
+    terminal: "https://pecanandpetal.facet.llc",
+    items: [{ id: "HCF-CARD", qty: 1 }],
+    ship: {
+      recipient: "T",
+      line1: "1 A St",
+      locality: "Austin",
+      region: "TX",
+      postal_code: "78701",
+      country: "US",
+    },
+    wallet: "default",
+    settle: true,
+    confirm: "3000000",
+  });
+  assertEquals(argv[0], "buy");
+  assert(argv.includes("--terminal") && argv.includes("https://pecanandpetal.facet.llc"));
+  assert(argv.includes("--settle"), "settle flag must be present");
+  const ci = argv.indexOf("--confirm");
+  assert(ci >= 0 && argv[ci + 1] === "3000000", "confirm value must be threaded");
+  // The 2-step (commit then arm the deferred redeem) runs in-process, so facet_buy
+  // must carry the run handler in addition to the spawn build.
+  assert(typeof tool.run === "function", "facet_buy must have the commit-then-arm run handler");
 });
 
 // ---- 6. the withdraw wiring maps to the CLI subcommand ---------------------
@@ -734,6 +784,20 @@ Deno.test("facet_lines is a run-only reader with no spawn wiring", () => {
   assertEquals(tool.perms, undefined);
 });
 
+Deno.test("facet_redeem_on_fulfillment is a run-only in-process tool requiring terminal + exchange_id", () => {
+  const tool = TOOLS.find((t) => t.name === "facet_redeem_on_fulfillment");
+  assert(tool !== undefined, "facet_redeem_on_fulfillment is not registered");
+  // In-process (MCP-only): signs and stores in the server, no CLI subcommand.
+  assert(tool.run !== undefined, "must expose an in-process run");
+  assertEquals(tool.script, undefined);
+  assertEquals(tool.build, undefined);
+  assertEquals(tool.perms, undefined);
+  // Requires the two fields the deferred-redeem store needs.
+  const schema = tool.inputSchema as { required?: string[] };
+  assert(schema.required?.includes("terminal"), "terminal must be required");
+  assert(schema.required?.includes("exchange_id"), "exchange_id must be required");
+});
+
 Deno.test("a per-line cancel with withdraw is refused in-process", async () => {
   const tool = TOOLS.find((t) => t.name === "facet_cancel");
   assert(tool !== undefined, "facet_cancel is not registered");
@@ -747,4 +811,242 @@ Deno.test("a per-line cancel with withdraw is refused in-process", async () => {
   const payload = JSON.parse(r.content[0].text) as { ok: boolean; error: string };
   assertEquals(payload.ok, false);
   assertStringIncludes(payload.error, "withdraw is single-line only");
+});
+
+// ---- classifyBuyArm: the facet_buy auto-arm routing (the per-line arm fix) ----
+// A per-line cart must arm the whole set on the per-line route (defer:true); a
+// single-voucher Boson buy arms its one exchange on the pooled store; everything
+// else (dry run, x402, failed commit) arms nothing. The earlier gate armed per-line orders on
+// the single-voucher store, where per-line exchanges never appear, so the arm
+// silently no-op'd and the order sat on-hold forever.
+
+Deno.test("classifyBuyArm: a per-line cart (perline: settlement_id) arms the whole set", () => {
+  const t = classifyBuyArm({
+    ok: true,
+    settled: true,
+    settlement_id: "perline:cart-abc",
+    exchange_ids: ["e1", "e2", "e3"],
+    provenance: { payment: { rail: "boson" } },
+  });
+  assertEquals(t.kind, "per-line");
+  assertEquals((t as Extract<BuyArmTarget, { kind: "per-line" }>).exchangeIds, ["e1", "e2", "e3"]);
+});
+
+Deno.test("classifyBuyArm: exchange_ids present routes per-line even without a perline marker", () => {
+  const t = classifyBuyArm({
+    ok: true,
+    settled: true,
+    exchange_ids: ["e1"],
+    provenance: { payment: { rail: "boson" } },
+  });
+  assertEquals(t.kind, "per-line");
+});
+
+Deno.test("classifyBuyArm: blank/non-string exchange ids are filtered out", () => {
+  const t = classifyBuyArm({
+    ok: true,
+    settled: true,
+    settlement_id: "perline:x",
+    exchange_ids: ["e1", "", 5, null, "e2"],
+    provenance: { payment: { rail: "boson" } },
+  });
+  assertEquals(t.kind, "per-line");
+  assertEquals((t as Extract<BuyArmTarget, { kind: "per-line" }>).exchangeIds, ["e1", "e2"]);
+});
+
+Deno.test("classifyBuyArm: a single-voucher Boson buy arms its one exchange", () => {
+  const t = classifyBuyArm({
+    ok: true,
+    settled: true,
+    settlement_id: "0xexchange1",
+    provenance: { payment: { rail: "boson" } },
+  });
+  assertEquals(t.kind, "single-voucher");
+  assertEquals(
+    (t as Extract<BuyArmTarget, { kind: "single-voucher" }>).settlementId,
+    "0xexchange1",
+  );
+});
+
+Deno.test("classifyBuyArm: an x402 buy is not armed", () => {
+  const t = classifyBuyArm({
+    ok: true,
+    settled: true,
+    settlement_id: "0xsettlement",
+    provenance: { payment: { rail: "x402" } },
+  });
+  assertEquals(t.kind, "none");
+});
+
+Deno.test("classifyBuyArm: a dry run (settled false) is not armed", () => {
+  const t = classifyBuyArm({
+    ok: true,
+    settled: false,
+    settlement_id: "perline:cart-abc",
+    exchange_ids: ["e1"],
+    provenance: { payment: { rail: "boson" } },
+  });
+  assertEquals(t.kind, "none");
+});
+
+Deno.test("classifyBuyArm: a failed commit is not armed", () => {
+  const t = classifyBuyArm({ ok: false, settled: true, exchange_ids: ["e1"] });
+  assertEquals(t.kind, "none");
+});
+
+Deno.test("classifyBuyArm: a Boson buy with no settlement id and no lines is not armed", () => {
+  const t = classifyBuyArm({
+    ok: true,
+    settled: true,
+    provenance: { payment: { rail: "boson" } },
+  });
+  assertEquals(t.kind, "none");
+});
+
+// ---- armPerLineDeferred / runRedeemOnFulfillment: the release-on-fulfillment arm ---
+// The per-line arm pre-signs each committed line locally and posts the set to the
+// Terminal's redeem route. release-on-fulfillment pre-signs BOTH the redeem AND the
+// completeExchange per line, so the merchant can be paid the moment they fulfil rather
+// than only after Boson's 7-day dispute window. These drive the real in-process arm
+// offline: a throwaway wallet key in FACET_WALLET_KEY, a usable (unexpired, issuer-less)
+// KYA in FACET_KYA so walletBoundKya never touches the network, and a stubbed fetch that
+// captures the POST body. No real wallet, no real network, and no secret in the result.
+
+// A deterministic throwaway key (test-only; holds nothing).
+const ARM_KEY = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+
+// A minimal wallet-usable KYA: unexpired, no issuer (so the trusted-issuer check is
+// skipped) and no payer_wallet binding, which is all kyaUsable needs to return true and
+// keep walletBoundKya offline.
+function usableKya(): string {
+  const b64url = (o: unknown) =>
+    btoa(JSON.stringify(o)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return `eyJhbGciOiJub25lIn0.${b64url({ exp: 9_999_999_999 })}.x`;
+}
+
+type CapturedCall = { url: string; body: Record<string, unknown> };
+
+// Run `fn` with the default wallet keyed to ARM_KEY, a usable KYA, and fetch stubbed to
+// record every call and answer 200 {ok:true}. Restores env + fetch afterwards. Tests in
+// a file run sequentially, so the shared env/fetch mutation is safe.
+async function withStubbedArm(fn: (calls: CapturedCall[]) => Promise<void>): Promise<void> {
+  const prev = {
+    key: Deno.env.get("FACET_WALLET_KEY"),
+    kya: Deno.env.get("FACET_KYA"),
+    wallets: Deno.env.get("FACET_WALLETS"),
+  };
+  Deno.env.delete("FACET_WALLETS");
+  Deno.env.set("FACET_WALLET_KEY", ARM_KEY);
+  Deno.env.set("FACET_KYA", usableKya());
+  const calls: CapturedCall[] = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = ((input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    calls.push({ url: String(input), body: JSON.parse(String(init?.body ?? "{}")) });
+    return Promise.resolve(
+      new Response(JSON.stringify({ ok: true, armed: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+  }) as typeof fetch;
+  const restore = (name: string, v: string | undefined) =>
+    v === undefined ? Deno.env.delete(name) : Deno.env.set(name, v);
+  try {
+    await fn(calls);
+  } finally {
+    globalThis.fetch = origFetch;
+    restore("FACET_WALLET_KEY", prev.key);
+    restore("FACET_KYA", prev.kya);
+    restore("FACET_WALLETS", prev.wallets);
+  }
+}
+
+Deno.test("armPerLineDeferred posts redeem_line_items carrying BOTH signed_payload and complete_payload per line (defer:true)", async () => {
+  await withStubbedArm(async (calls) => {
+    const exchangeIds = ["26", "27"];
+    const r = await armPerLineDeferred({ terminal: "https://x.facet.llc" }, exchangeIds);
+    assertEquals(r.isError, false);
+    // Exactly one POST, to the per-line redeem route.
+    const redeemCalls = calls.filter((c) => c.url.includes("/ucp/v1/checkout-sessions/redeem"));
+    assertEquals(redeemCalls.length, 1, "expected one POST to the per-line redeem route");
+    const body = redeemCalls[0].body;
+    assertEquals(body.defer, true);
+    const lines = body[perLineBodyKey("redeem")] as Array<Record<string, string>>;
+    assert(Array.isArray(lines), "redeem_line_items must be an array");
+    assertEquals(lines.length, exchangeIds.length);
+    lines.forEach((line, i) => {
+      assertEquals(line.exchange_id, exchangeIds[i]);
+      // The redeem meta-tx (required) AND the completeExchange meta-tx (the new
+      // release-on-fulfillment pre-sign) both ride each line, and they are distinct.
+      assert(
+        typeof line.signed_payload === "string" && line.signed_payload.length > 0,
+        "each line must carry a redeem signed_payload",
+      );
+      assert(
+        typeof line.complete_payload === "string" && line.complete_payload.length > 0,
+        "each line must carry a completeExchange complete_payload",
+      );
+      assert(
+        line.signed_payload !== line.complete_payload,
+        "the redeem and complete payloads must differ",
+      );
+    });
+  });
+});
+
+Deno.test("armPerLineDeferred never leaks the wallet key or the raw payloads into its result", async () => {
+  await withStubbedArm(async (calls) => {
+    const r = await armPerLineDeferred({ terminal: "https://x.facet.llc" }, ["26"]);
+    const text = r.content[0].text;
+    assert(!text.includes(ARM_KEY), "the wallet key must never enter the tool result");
+    const line = (calls[0].body[perLineBodyKey("redeem")] as Array<Record<string, string>>)[0];
+    assert(!text.includes(line.signed_payload), "the raw redeem payload must not enter the result");
+    assert(
+      !text.includes(line.complete_payload),
+      "the raw complete payload must not enter the result",
+    );
+  });
+});
+
+Deno.test("runRedeemOnFulfillment (redeem-only) is unaffected: its body carries signed_payload and NO complete_payload", async () => {
+  await withStubbedArm(async (calls) => {
+    const r = await runRedeemOnFulfillment({ terminal: "https://x.facet.llc", exchange_id: "42" });
+    assertEquals(r.isError, false);
+    assert(calls.length >= 1, "expected a redeem POST");
+    const body = calls[calls.length - 1].body;
+    assert(
+      typeof body.signed_payload === "string" && (body.signed_payload as string).length > 0,
+      "the single-voucher redeem still signs a redeem payload",
+    );
+    assertEquals(
+      "complete_payload" in body,
+      false,
+      "the redeem-only path must NOT pre-sign a completeExchange",
+    );
+  });
+});
+
+// facet_lines falls back to the settle-time archive for a SETTLED per-line order
+// (its live checkout session is gone). readArchivedLines is that fallback source.
+Deno.test("readArchivedLines: returns the settle-time escrow_lines, null when absent", () => {
+  const dir = Deno.makeTempDirSync();
+  const prev = Deno.env.get("FACET_RECEIPTS_DIR");
+  Deno.env.set("FACET_RECEIPTS_DIR", dir);
+  try {
+    const lines = [
+      { exchange_id: "50", sku: "HCF-BDAY", amount_minor: 1624 },
+      { exchange_id: "51", amount_minor: 900 },
+    ];
+    Deno.writeTextFileSync(`${dir}/ord-1.json`, JSON.stringify({ escrow_lines: lines }));
+    assertEquals(readArchivedLines("ord-1"), { escrow_lines: lines });
+    // No archive → null (lets runLinesRead surface the Terminal's original error).
+    assertEquals(readArchivedLines("missing"), null);
+    // An archived order with no escrow_lines (a pooled order) → null, not an empty set.
+    Deno.writeTextFileSync(`${dir}/pooled.json`, JSON.stringify({ jws: "x" }));
+    assertEquals(readArchivedLines("pooled"), null);
+  } finally {
+    if (prev === undefined) Deno.env.delete("FACET_RECEIPTS_DIR");
+    else Deno.env.set("FACET_RECEIPTS_DIR", prev);
+    Deno.removeSync(dir, { recursive: true });
+  }
 });

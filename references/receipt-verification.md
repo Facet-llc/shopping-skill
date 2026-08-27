@@ -22,9 +22,10 @@ The receipt is pull-model, and it is anchored server-side before the checkout
 COMPLETE response returns (the ledger append is awaited during response signing),
 so a fetch right after a settled buy is race-free.
 
-- `buy --settle` returns it inline under `receipt` (fetched and verified for you).
-- `receipt --terminal <url> --order-id <id>` re-fetches and verifies it for any past
-  order.
+- `facet_buy` with `settle: true` returns it inline under `receipt` (fetched and
+  verified for you).
+- `facet_get_receipt` with `terminal` and `order_id` re-fetches and verifies it for
+  any past order.
 
 Both call `POST /v1/get_receipt {order_id}` on the buyer's KYA. The Terminal returns
 `{ receipt: { format, jws, kid, provider_jwks } }`, where `jws` is the compact JWS.
@@ -39,12 +40,12 @@ skill mints a fresh, throwaway `aid` per checkout and caches only the short-live
 KYA, so once that KYA expires the `aid` cannot be reproduced and `get_receipt`
 answers `403`. Two things make the receipt durable anyway:
 
-1. `buy --settle` fetches the receipt inline while the KYA is still alive, so the
-   buyer holds the self-contained JWS from the moment of purchase. Once held, it
-   verifies forever with no further call.
+1. `facet_buy` with `settle: true` fetches the receipt inline while the KYA is still
+   alive, so the buyer holds the self-contained JWS from the moment of purchase. Once
+   held, it verifies forever with no further call.
 2. To retrieve a past order later, the caller proves control of the order's
-   **payer wallet** instead of the expired `aid`. `receipt --order-id <id>` signs a
-   canonical challenge with the wallet and re-POSTs `get_receipt` with a
+   **payer wallet** instead of the expired `aid`. `facet_get_receipt` with `order_id`
+   signs a canonical challenge with the wallet and re-POSTs `get_receipt` with a
    `wallet_auth` block:
 
    ```json
@@ -112,7 +113,7 @@ Notes on the claims:
   anchors to the newest, so it is a snapshot, not a final word.
 - `attestations` are counterparty signatures. The array is empty right after a fresh
   buy and that is NOT a negative signal; merchant and agent countersignatures accrue
-  as they are added. Re-fetch with `receipt` to pick them up.
+  as they are added. Re-fetch with `facet_get_receipt` to pick them up.
 - `split` is present only when Facet actually recorded a reconciling split. Absent
   means unknown, never zero: a receipt claiming `tax_minor: 0` for an order whose tax
   was never recorded would be a signed falsehood, which is worse than a signed gap.

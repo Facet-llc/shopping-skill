@@ -1,7 +1,9 @@
 # Architecture
 
 How the shopping skill works end to end: the two surfaces, the flow, discovery,
-the rail, and the subcommand and environment contracts.
+the rail, and the environment contract. The skill is driven over MCP; the `facet_*`
+tools are the only interface, and `scripts/facet-checkout.ts` is the internal
+implementation they spawn, not a command line to run.
 
 ## Contents
 
@@ -11,7 +13,6 @@ the rail, and the subcommand and environment contracts.
 - The SKU join key
 - The settlement rail
 - UCP checkout and platform origination
-- Subcommand reference
 - Environment contract
 
 ## The two surfaces
@@ -41,44 +42,46 @@ discovered as agent-ready. The flow never leads with the Terminal.
    on any store.
 2. **Spot the agent-checkout badge** and read it. The badge links to the store's
    `agents.txt`. It is a hint to verify, never proof.
-3. **Discover and alert.** Resolve the store's `agents.txt` (`discover --site`). If
-   it advertises a Terminal, tell the user the store is agent-ready. If not, stay in
-   ordinary browsing.
+3. **Discover and alert.** Resolve the store's `agents.txt` (`facet_discover` with
+   `site`). If it advertises a Terminal, tell the user the store is agent-ready. If
+   not, stay in ordinary browsing.
 4. **Offer agent checkout and choose the wallet.** Ask whether to use agent
-   checkout and which wallet to pay from. `wallets` lists label, address, and USDC
-   balance. The chosen wallet sets identity, spendable balance, and funds source at
-   once.
+   checkout and which wallet to pay from. `facet_wallet_list` lists label, address,
+   and USDC balance. The chosen wallet sets identity, spendable balance, and funds
+   source at once.
 5. **Self-issue the wallet-bound identity.** Mint a wallet-bound KYA (an ES256 JWT
-   from `issuer.facet.llc`) for the chosen wallet (`provision`), self-serve, no
-   service key. Needed because the directory
+   from `issuer.facet.llc`) for the chosen wallet (`facet_provision` with `wallet`),
+   self-serve, no service key. Needed because the directory
    and the Terminal are identity-gated.
 6. **Find the Terminal in the directory.** Search the directory by business name
-   (`directory --query`) and read the matching `terminal_url`. This resolves the
-   canonical Terminal from Facet's records even if the storefront `agents.txt` is
-   stale. Cross-check against step 3.
-7. **Quote (DRY).** Run `buy` without `--settle`. This creates the UCP checkout,
-   reads the merchant's offer, validates it against the guardrails, signs the
-   payment authorization locally, and stops. Nothing moves. It returns the exact
-   price and a confirm value.
+   (`facet_directory` with `query`) and read the matching `terminal_url`. This
+   resolves the canonical Terminal from Facet's records even if the storefront
+   `agents.txt` is stale. Cross-check against step 3.
+7. **Quote (DRY).** Call `facet_buy` with `terminal`, `items`, and `ship`, and omit
+   `settle`. This creates the UCP checkout, reads the merchant's offer, validates it
+   against the guardrails, signs the payment authorization locally, and stops.
+   Nothing moves. It returns the exact price and a confirm value.
 8. **Confirm and settle.** Show the total, items, and paying wallet, get an explicit
-   yes, then run `buy` with `--settle --confirm <atomic>`. Report status, order id,
-   settlement id, and the signed receipt. One confirmation per settlement.
+   yes, then call `facet_buy` with `settle: true` and `confirm: <atomic>`. Report
+   status, order id, settlement id, and the signed receipt. One confirmation per
+   settlement.
 
 ## Discovery: agents.txt and the directory
 
 Two mechanisms, one answer to "does this merchant have a Terminal."
 
-- **Per host: `discover --site <host>`.** Resolves the store's own
+- **Per host: `facet_discover` with `site`.** Resolves the store's own
   `/.well-known/agents.txt` (unauthenticated). Authoritative for a single site: the
   store telling you, on its own domain, that it runs a Terminal and where. The
   client then re-reads the manifest at the Terminal's own host and trusts that
   canonical copy over the storefront copy, because a storefront plugin can serve a
   drifted copy from stored settings while the Terminal generates the canonical
   manifest per request.
-- **Across the network: `directory --query ...`.** Searches the Facet directory
-  (identity-gated) for merchants that fit a query, location, capability, or
-  taxonomy, and reports which have a live Terminal. Use it to find a store from an
-  intent, and to resolve the canonical Terminal by business name.
+- **Across the network: `facet_directory` (with `query`, and `near`, `taxonomy`, or
+  `capabilities`).** Searches the Facet directory (identity-gated) for merchants
+  that fit a query, location, capability, or taxonomy, and reports which have a live
+  Terminal. Use it to find a store from an intent, and to resolve the canonical
+  Terminal by business name.
 
 ## The SKU join key
 
@@ -116,23 +119,15 @@ The buyer's KYA is echoed into the payment instrument itself
 (`instruments[0].kya`), not only the Authorization header, because the Terminal
 binds identity at settlement to the instrument.
 
-## Subcommand reference
+## Internal implementation
 
-All in `scripts/facet-checkout.ts`. Each prints one JSON object to stdout; progress
-notes go to stderr.
-
-- `wallets`: list configured wallets (label, address, USDC balance, KYA present).
-- `discover --site <host>`: resolve one host's `agents.txt`.
-- `directory --query <q> [filters]`: search the Facet directory (identity-gated).
-- `search --terminal <url> [filters]`: the merchant's own transaction catalog.
-- `product --terminal <url> --id <id>`: one product's rail detail.
-- `provision [--wallet <label>]`: self-serve mint a wallet-bound KYA.
-- `buy --terminal <url> --items <json> --ship <json> [--settle --confirm <atomic>]`:
-  the checkout, dry by default.
-
-`scripts/browse-storefront.ts` is a last-resort public-catalog reader (WooCommerce
-Store API, then JSON-LD), used only when neither the assistant's browser nor the
-Terminal `search` is available. It touches no secrets.
+The `facet_*` MCP tools are the only interface. Under the hood, most spawn
+`scripts/facet-checkout.ts` (the identity and money-path implementation) as a child
+process and relay the single JSON object it prints; it reads the wallet key inside
+that child and is not a command line to run. `scripts/browse-storefront.ts` is a
+last-resort public-catalog reader (WooCommerce Store API, then JSON-LD), used only
+when neither the assistant's browser nor the `facet_search` tool is available. It
+touches no secrets.
 
 ## Environment contract
 

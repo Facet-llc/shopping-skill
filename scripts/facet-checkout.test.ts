@@ -7,7 +7,13 @@
 // The import pulls in facet-checkout.ts, whose CLI dispatch is guarded by
 // import.meta.main (false here), so importing it runs no command.
 
-import { assert, assertEquals, assertThrows } from "jsr:@std/assert@^1";
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertStringIncludes,
+  assertThrows,
+} from "jsr:@std/assert@^1";
 import { CompactSign, exportJWK, generateKeyPair } from "npm:jose@5.9.6";
 import { privateKeyToAccount } from "npm:viem@2.50.4/accounts";
 import {
@@ -18,10 +24,16 @@ import {
 } from "npm:viem@2.50.4";
 import {
   assertDisplayScalarsSane,
+  assertMppMethodEvm,
   assertMppTerms,
   assertOfferMatches,
+  buildBosonCommitInstrument,
   buildProvenance,
+  classifyBosonAdvertisement,
   decodeBosonCommit,
+  extractExchangeIds,
+  extractEscrowLines,
+  ucpTotalMinor,
   kyaIdentity,
   mppRefusedForEscrow,
   assertX402Terms,
@@ -32,15 +44,19 @@ import {
   buildResolveBody,
   buildRevisePlan,
   buildWithdrawTypedData,
+  BOSON_BUYER_PROTECTION,
+  X402_BUYER_PROTECTION,
   chooseRail,
   type CurrentProduct,
   dedupReceiptIndex,
   errorReason,
   forcedRailIdFor,
   isFirstPartyTarget,
+  postSingleCancel,
   receiptsDir,
   type ReorderLineItem,
   resolveReorderCandidates,
+  signBosonAction,
   verifyReceipt,
 } from "./facet-checkout.ts";
 import {
@@ -217,6 +233,25 @@ Deno.test("CRITICAL: x402 amount over the cap is refused", () => {
   assertThrows(() => assertX402Terms({ ...x402Adv(), amountAtomic: "30000000" }, x402Expect()), Error, "exceeds");
 });
 
+Deno.test("buyer_protection is rail-accurate: x402-direct is never sold as escrow", () => {
+  // The bug this guards: telling every buyer their money is "safe in escrow, releases
+  // on ship" even on x402-direct, which is a direct transfer straight to the merchant.
+  assertEquals(X402_BUYER_PROTECTION.escrow, false);
+  assert(
+    /not (be )?held in escrow/i.test(X402_BUYER_PROTECTION.summary),
+    "x402 summary must state it is NOT escrow",
+  );
+  assert(
+    /refund/i.test(X402_BUYER_PROTECTION.recourse) &&
+      /terminal/i.test(X402_BUYER_PROTECTION.recourse),
+    "x402 recourse must point to a Terminal refund request against the receipt",
+  );
+  // Boson escrow is the ONLY rail where the escrow-protection language is correct.
+  assertEquals(BOSON_BUYER_PROTECTION.escrow, true);
+  assert(/escrow/i.test(BOSON_BUYER_PROTECTION.summary));
+  assert(/cancel|dispute/i.test(BOSON_BUYER_PROTECTION.recourse));
+});
+
 Deno.test("x402 non-canonical amount is refused (scientific, hex, fractional, whitespace, sign, zero)", () => {
   // Each parses to a plausible number under Number() but is not the canonical
   // atomic string the ERC-3009 signature binds under BigInt(); the ^\d+$ guard
@@ -272,6 +307,16 @@ Deno.test("MPP swapped currency (not USDC) is refused", () => {
 
 Deno.test("CRITICAL: MPP amount over the cap is refused", () => {
   assertThrows(() => assertMppTerms({ ...mppChal(), amountAtomic: "30000000" }, mppExpect()), Error, "exceeds");
+});
+
+Deno.test("MPP evm/charge method is accepted (the wallet method this skill signs)", () => {
+  assertMppMethodEvm("evm", "charge");
+  assertMppMethodEvm("EVM", "charge");
+});
+
+Deno.test("MPP stripe/charge (card) method is refused with actionable guidance", () => {
+  assertThrows(() => assertMppMethodEvm("stripe", "charge"), Error, "does not mint");
+  assertThrows(() => assertMppMethodEvm("stripe", "charge"), Error, "evm/charge");
 });
 
 Deno.test("MPP non-canonical amount is refused (scientific, hex, fractional, whitespace, sign, zero)", () => {
@@ -1020,6 +1065,50 @@ Deno.test("withdraw EIP-712: the digest changes when any signed field changes (n
   assert(h({ ...base, chainId: 84532 }) !== baseHash, "chain (salt) is not bound");
 });
 
+// ---- signBosonAction: the buyer's gasless post-commit meta-txs -------------
+// The release-on-fulfillment arm pre-signs TWO meta-txs per line: the redeem
+// (boson-redeem -> redeemVoucher) and the completeExchange (boson-complete ->
+// completeExchange). Both are gasless buyer meta-txs; the x402-client encodes each as
+// an ABI tuple whose `functionName` field carries the Boson function name literally, so
+// a decode-free check on the payload hex proves which meta-tx was signed. No network and
+// no real wallet: a throwaway key signs a fixed exchange id offline (BOSON_ESCROW
+// defaults to the Base mainnet Diamond, and signing is pure).
+
+// A deterministic throwaway key (test-only; holds nothing).
+const SIGN_KEY = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+
+// The ASCII of `s` as lowercase hex, the form an ABI-encoded `string` field takes inside
+// the signed payload, so a substring check reveals which function name it embeds.
+const asciiHex = (s: string) =>
+  Array.from(new TextEncoder().encode(s)).map((b) => b.toString(16).padStart(2, "0")).join("");
+
+Deno.test("signBosonAction: boson-complete signs a completeExchange meta-tx, distinct from the redeem", async () => {
+  const redeem = await signBosonAction(SIGN_KEY, "boson-redeem", "42");
+  const complete = await signBosonAction(SIGN_KEY, "boson-complete", "42");
+  // Both are non-empty hex payloads.
+  assert(redeem.startsWith("0x") && redeem.length > 2, "redeem payload is empty");
+  assert(complete.startsWith("0x") && complete.length > 2, "complete payload is empty");
+  // Distinct payloads: a different function is encoded (and the nonce is independent).
+  assert(complete !== redeem, "the complete payload must differ from the redeem payload");
+  // boson-complete really reaches signMetaTxCompleteExchange: its payload embeds the
+  // completeExchange function name and NOT redeemVoucher.
+  assertStringIncludes(complete, asciiHex("completeExchange"));
+  assert(!complete.includes(asciiHex("redeemVoucher")), "complete must not encode a redeem");
+  // The redeem path is unaffected: still a redeemVoucher meta-tx, never completeExchange.
+  assertStringIncludes(redeem, asciiHex("redeemVoucher"));
+  assert(!redeem.includes(asciiHex("completeExchange")), "redeem must not encode a complete");
+});
+
+Deno.test("signBosonAction: an unknown action id is rejected by the signer, never silently signed", async () => {
+  // The boson-complete alias is a real, bounded map, not a catch-all: an id the
+  // x402-client does not know still throws rather than producing a bogus payload.
+  await assertRejects(
+    () => signBosonAction(SIGN_KEY, "boson-bogus", "42"),
+    Error,
+    "unsupported post-commit action",
+  );
+});
+
 // ---------------------------------------------------------------------------
 // Receipt verification: the portable, self-verifying settlement proof.
 //
@@ -1261,4 +1350,272 @@ Deno.test("buildRevisePlan: omits the wallet flag when no label is given", () =>
   const plan = buildRevisePlan("https://x.facet.llc", "7", [{ id: "A", qty: 2 }]);
   assert(!plan.steps[0]!.command.includes("--wallet"), "no wallet flag without a label");
   assert(plan.steps[1]!.command.includes('[{"id":"A","qty":2}]'), "rebuy carries the cart");
+});
+
+// ---------------------------------------------------------------------------
+// Per-line Boson escrow commit: detection, offline assembly, and the cart-sum
+// invariant. No wallet, no network: every test drives the pure builders that
+// cmdBuy's per-line path composes (classify the advertisement, validate each
+// offer with the SAME assertOfferMatches guardrail, assemble the `lines`
+// credential, and refuse a cart whose offers do not sum to the priced total).
+// ---------------------------------------------------------------------------
+
+// A single per-line offer object, the shape the seller signs and the SDK settles.
+function plOffer(amountAtomic: string) {
+  return { amount: amountAtomic, asset: USDC, network: "eip155:8453", escrowAddress: ESCROW_OFFER };
+}
+
+Deno.test("classifyBosonAdvertisement: single offer with no line_index is pooled", () => {
+  const entries = [{ config: { price_atomic: "5000000", chain_id: "8453", network: "base", offer: plOffer("5000000") } }];
+  const adv = classifyBosonAdvertisement(entries);
+  assertEquals(adv.kind, "pooled");
+  if (adv.kind === "pooled") assertEquals(adv.config.price_atomic, "5000000");
+});
+
+Deno.test("classifyBosonAdvertisement: N offers each with a line_index is per-line", () => {
+  const entries = [
+    { config: { line_index: 0, price_atomic: "1000000", chain_id: "8453", network: "base", offer: plOffer("1000000") } },
+    { config: { line_index: 1, price_atomic: "4000000", chain_id: "8453", network: "base", offer: plOffer("4000000") } },
+  ];
+  const adv = classifyBosonAdvertisement(entries);
+  assertEquals(adv.kind, "perline");
+  if (adv.kind === "perline") assertEquals(adv.configs.length, 2);
+});
+
+Deno.test("classifyBosonAdvertisement: absent, empty, or config-less handler is none", () => {
+  assertEquals(classifyBosonAdvertisement(undefined).kind, "none");
+  assertEquals(classifyBosonAdvertisement([]).kind, "none");
+  assertEquals(classifyBosonAdvertisement([{}]).kind, "none");
+});
+
+Deno.test("classifyBosonAdvertisement: a mixed per-line / pooled advertisement fails closed", () => {
+  const entries = [{ config: { line_index: 0, offer: plOffer("1000000") } }, { config: { offer: plOffer("4000000") } }];
+  assertThrows(() => classifyBosonAdvertisement(entries), Error, "mixes per-line and pooled");
+});
+
+Deno.test("classifyBosonAdvertisement: multiple pooled offers (none carry a line_index) fail closed", () => {
+  const entries = [{ config: { offer: plOffer("1000000") } }, { config: { offer: plOffer("4000000") } }];
+  assertThrows(() => classifyBosonAdvertisement(entries), Error, "none carry a line_index");
+});
+
+Deno.test("buildBosonCommitInstrument pooled: one authorization carrying x_payment + requirements", () => {
+  const req = plOffer("5000000");
+  const out = buildBosonCommitInstrument("kya.buyer", { kind: "pooled", xPayment: "XP-POOLED", requirements: req });
+  assertEquals(out.instruments.length, 1);
+  assertEquals(out.instruments[0]!.kya, "kya.buyer");
+  const cred = out.instruments[0]!.credential;
+  assertEquals(cred.type, "boson_commit_authorization");
+  assertEquals(cred.x_payment, "XP-POOLED");
+  assertEquals(cred.requirements, req);
+  assert(!("lines" in cred), "pooled credential carries no lines array");
+});
+
+Deno.test("buildBosonCommitInstrument per-line: N authorizations, sorted, with the right line_index/x_payment/requirements", () => {
+  const r0 = plOffer("1000000");
+  const r1 = plOffer("4000000");
+  // Pass the lines out of order to prove the builder sorts by line_index.
+  const out = buildBosonCommitInstrument("kya.buyer", {
+    kind: "perline",
+    cartTotalMinor: 500, // (1_000_000 + 4_000_000) / 10_000
+    lines: [
+      { lineIndex: 1, xPayment: "XP-1", requirements: r1, amountAtomic: 4_000_000 },
+      { lineIndex: 0, xPayment: "XP-0", requirements: r0, amountAtomic: 1_000_000 },
+    ],
+  });
+  assertEquals(out.instruments.length, 1);
+  assertEquals(out.instruments[0]!.kya, "kya.buyer");
+  const cred = out.instruments[0]!.credential as { type: string; lines: Array<Record<string, unknown>> };
+  assertEquals(cred.type, "boson_commit_authorization");
+  assert(!("x_payment" in cred), "per-line credential carries no top-level x_payment");
+  assertEquals(cred.lines.length, 2);
+  assertEquals(cred.lines[0], { line_index: 0, x_payment: "XP-0", requirements: r0 });
+  assertEquals(cred.lines[1], { line_index: 1, x_payment: "XP-1", requirements: r1 });
+});
+
+Deno.test("CRITICAL: buildBosonCommitInstrument per-line refuses when the amounts do not sum to the cart total", () => {
+  // Lines sum to 5_000_000 atomic (500 minor), but the priced cart total says 600.
+  assertThrows(
+    () =>
+      buildBosonCommitInstrument("kya.buyer", {
+        kind: "perline",
+        cartTotalMinor: 600,
+        lines: [
+          { lineIndex: 0, xPayment: "XP-0", requirements: plOffer("1000000"), amountAtomic: 1_000_000 },
+          { lineIndex: 1, xPayment: "XP-1", requirements: plOffer("4000000"), amountAtomic: 4_000_000 },
+        ],
+      }),
+    Error,
+    "do not match the priced cart",
+  );
+});
+
+Deno.test("buildBosonCommitInstrument per-line refuses a duplicate line_index", () => {
+  const r = plOffer("1000000");
+  assertThrows(
+    () =>
+      buildBosonCommitInstrument("kya.buyer", {
+        kind: "perline",
+        cartTotalMinor: 200,
+        lines: [
+          { lineIndex: 0, xPayment: "XP-A", requirements: r, amountAtomic: 1_000_000 },
+          { lineIndex: 0, xPayment: "XP-B", requirements: r, amountAtomic: 1_000_000 },
+        ],
+      }),
+    Error,
+    "duplicate line_index",
+  );
+});
+
+Deno.test("buildBosonCommitInstrument per-line refuses an empty line set", () => {
+  assertThrows(
+    () => buildBosonCommitInstrument("kya.buyer", { kind: "perline", cartTotalMinor: 0, lines: [] }),
+    Error,
+    "no lines to settle",
+  );
+});
+
+Deno.test("per-line advertisement end-to-end (offline): classify, validate each offer, then build N authorizations", () => {
+  // A mock 2-line per-line advertisement as the checkout CREATE would return it,
+  // deliberately out of line_index order.
+  const offer0 = plOffer("1000000");
+  const offer1 = plOffer("4000000");
+  const entries = [
+    { config: { line_index: 1, price_atomic: "4000000", chain_id: "8453", network: "base", seller_id: "S", offer: offer1 } },
+    { config: { line_index: 0, price_atomic: "1000000", chain_id: "8453", network: "base", seller_id: "S", offer: offer0 } },
+  ];
+  const adv = classifyBosonAdvertisement(entries);
+  assertEquals(adv.kind, "perline");
+  if (adv.kind !== "perline") return;
+  // Validate each line's offer with the SAME guardrail cmdBuy applies per line,
+  // then collect the signed lines (mock X-PAYMENTs stand in for the wallet's local
+  // signatures, which need no network here).
+  const signed = adv.configs.map((cfg) => {
+    const priceAtomic = Number(cfg["price_atomic"]);
+    assertOfferMatches(cfg["offer"] as Record<string, unknown>, {
+      priceAtomic,
+      capAtomic: 25_000_000,
+      usdc: USDC,
+      chainId: 8453,
+      escrow: ESCROW,
+    });
+    const lineIndex = Number(cfg["line_index"]);
+    return {
+      lineIndex,
+      xPayment: `XP-${lineIndex}`,
+      requirements: cfg["offer"] as Record<string, unknown>,
+      amountAtomic: priceAtomic,
+    };
+  });
+  const out = buildBosonCommitInstrument("kya.buyer", { kind: "perline", cartTotalMinor: 500, lines: signed });
+  const cred = out.instruments[0]!.credential as { type: string; lines: Array<Record<string, unknown>> };
+  assertEquals(cred.type, "boson_commit_authorization");
+  assertEquals(cred.lines.length, 2);
+  assertEquals(cred.lines[0], { line_index: 0, x_payment: "XP-0", requirements: offer0 });
+  assertEquals(cred.lines[1], { line_index: 1, x_payment: "XP-1", requirements: offer1 });
+});
+
+Deno.test("ucpTotalMinor: reads the `total` entry amount from a UCP totals breakdown", () => {
+  const totals = [
+    { type: "subtotal", display_text: "Subtotal", amount: 500 },
+    { type: "total", display_text: "Total", amount: 500 },
+  ];
+  assertEquals(ucpTotalMinor(totals), 500);
+});
+
+Deno.test("ucpTotalMinor: null when the total is absent or not a number", () => {
+  assertEquals(ucpTotalMinor(undefined), null);
+  assertEquals(ucpTotalMinor([]), null);
+  assertEquals(ucpTotalMinor([{ type: "subtotal", amount: 500 }]), null);
+  assertEquals(ucpTotalMinor([{ type: "total", amount: "500" }]), null);
+});
+
+Deno.test("extractExchangeIds: reads escrow_lines[].exchange_id in order", () => {
+  const completion = {
+    escrow_lines: [
+      { line_index: 0, exchange_id: "101", amount: "1000000" },
+      { line_index: 1, exchange_id: "102", amount: "4000000" },
+    ],
+  };
+  assertEquals(extractExchangeIds(completion), ["101", "102"]);
+});
+
+Deno.test("extractExchangeIds: [] when the completion carried no escrow_lines (pooled)", () => {
+  assertEquals(extractExchangeIds({ escrow_state: { exchange_id: "9" } }), []);
+  assertEquals(extractExchangeIds({}), []);
+});
+
+Deno.test("extractEscrowLines: maps exchange -> cart sku + sealed amount (atomic to minor)", () => {
+  const completion = {
+    escrow_lines: [
+      { line_index: 0, exchange_id: "46", amount: "16240000", currency: "USDC" },
+      { line_index: 1, exchange_id: "48", amount: "3250000", currency: "USDC" },
+      { line_index: 2, exchange_id: "47", amount: "9000000", currency: "USDC" },
+    ],
+  };
+  const cart = [{ id: "HCF-BDAY", qty: 1 }, { id: "HCF-CARD", qty: 1 }];
+  // Atomic USDC (6dp) -> minor units (cents): 16240000 -> 1624 ($16.24), etc. The
+  // sealed per-line amount carries the line's allocated tax (the card is $3.25, not $3.00).
+  // Line 2 (delivery) has no cart item, so no sku, but its amount is still carried.
+  assertEquals(extractEscrowLines(completion, cart), [
+    { exchange_id: "46", sku: "HCF-BDAY", amount_minor: 1624 },
+    { exchange_id: "48", sku: "HCF-CARD", amount_minor: 325 },
+    { exchange_id: "47", amount_minor: 900 },
+  ]);
+});
+
+Deno.test("extractEscrowLines: [] for a pooled order (no escrow_lines)", () => {
+  assertEquals(extractEscrowLines({ escrow_state: { exchange_id: "9" } }, []), []);
+});
+
+// postSingleCancel: a single-exchange cancel of a PER-LINE order 404s on the pooled
+// body and must transparently retry as a one-item cancel_line_items set. Captures the
+// request bodies to prove BOTH the retry and that it carries the same exchange.
+Deno.test("postSingleCancel: 404 on the pooled body retries as a per-line set", async () => {
+  const bodies: Array<Record<string, unknown>> = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = ((input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    bodies.push(JSON.parse(String(init?.body ?? "{}")));
+    if (!url.endsWith("/ucp/v1/checkout-sessions/cancel")) {
+      return Promise.resolve(new Response("nope", { status: 500 }));
+    }
+    const body = bodies[bodies.length - 1]!;
+    // The pooled single-voucher body 404s (no checkout session for a per-line order).
+    if ("exchange_id" in body) return Promise.resolve(new Response("no session", { status: 404 }));
+    // The per-line body succeeds.
+    return Promise.resolve(
+      new Response(JSON.stringify({ status: "cancelled", cancelled: 1 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+  }) as typeof fetch;
+  try {
+    const r = await postSingleCancel("https://m.example", "51", "0xsig", "kya");
+    assert(r.ok, "the retry through the per-line route should succeed");
+    assertEquals(bodies.length, 2, "should post twice: pooled, then per-line");
+    assertEquals(bodies[0], { exchange_id: "51", signed_payload: "0xsig" });
+    assertEquals(bodies[1], { cancel_line_items: [{ exchange_id: "51", signed_payload: "0xsig" }] });
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+// A NON-404 failure is a real error and must NOT be reshaped or retried: post once,
+// return the failure as-is so dieLifecycle surfaces the true status.
+Deno.test("postSingleCancel: a non-404 failure is returned unchanged (no retry)", async () => {
+  let calls = 0;
+  const original = globalThis.fetch;
+  globalThis.fetch = ((): Promise<Response> => {
+    calls += 1;
+    return Promise.resolve(new Response("forbidden", { status: 403 }));
+  }) as typeof fetch;
+  try {
+    const r = await postSingleCancel("https://m.example", "51", "0xsig", "kya");
+    assert(!r.ok, "a 403 is a failure");
+    assertEquals(calls, 1, "a non-404 must not trigger the per-line retry");
+    if (!r.ok) assertEquals(r.http_status, 403);
+  } finally {
+    globalThis.fetch = original;
+  }
 });

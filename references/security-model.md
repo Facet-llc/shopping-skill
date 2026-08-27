@@ -40,8 +40,9 @@ into a signature over different terms.
 
 - The wallet key is read from the environment, used to sign locally, and never
   transmitted, logged, or persisted. Only signatures leave the process.
-- Funds settle on-chain from the user's wallet into the merchant's escrow. No
-  Facet server is a custodian.
+- Funds settle on-chain from the user's wallet to the merchant's rail destination:
+  Boson escrow, or the merchant's own payout wallet on x402-direct. No Facet
+  server is a custodian.
 - No issuer service key exists in this repository. The KYA is minted through the
   public self-serve enroll path, authenticated by the user's own wallet proof.
 
@@ -119,7 +120,7 @@ exact field it signs.
 
 ### 7. Price drift between quote and settle
 
-**Defense.** Settlement is a separate, explicit step. The `--confirm` value must
+**Defense.** Settlement is a separate, explicit step. The `confirm` value must
 equal the freshly advertised price, and that price is bound to the seller-signed
 offer `amount` proven equal earlier in the same process. If the price changed
 after the dry quote, settlement is refused and the user re-quotes.
@@ -210,9 +211,9 @@ and consumes the nonce so the same attestation cannot be replayed. The attestati
 opens the ticket only: it authorizes no amount and moves no funds, and the merchant
 still approves before any send-back or split. A store without the autonomous path
 enabled rejects the request, and the client reports that rather than routing around
-it. This is the refund analogue of the buyer-signed `cancel` and `dispute` meta-txs,
-a second independent factor the buyer proves itself, which keeps the money path
-dual-auth without a platform co-signature.
+it. This is the refund analogue of the buyer-signed `facet_cancel` and `facet_dispute`
+meta-txs, a second independent factor the buyer proves itself, which keeps the money
+path dual-auth without a platform co-signature.
 
 ## Identity: self-issued, wallet-bound KYA
 
@@ -245,7 +246,7 @@ scoped `--allow-write="$HOME/.cache"`. The storefront reader needs only
 
 ## Operational defaults
 
-- Dry-run first: the default `buy` moves nothing.
+- Dry-run first: the default `facet_buy` (no `settle`) moves nothing.
 - One confirmation per settlement: a yes for one purchase is not a yes for the next.
 - HTTPS only for identity and checkout.
 - A conservative per-checkout cap under an absolute ceiling.

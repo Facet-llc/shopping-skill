@@ -4,6 +4,46 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [1.4.0] - 2026-08-27
+
+### Added
+- `facet_render_receipt` now amends the original settlement receipt in place after a reversal: a cancel, withdraw, dispute, or refund adds an Amendments section below the untouched settlement showing the reversed line(s), the amount returned, a running net, and each reversal's own signed `facet-lifecycle+jws` receipt (embedded and verifiable in-browser). It builds this from the order's archived escrow lines plus the archived lifecycle receipts, so it works after settlement with no live call.
+- `facet_mpp_charge` now refuses a non-`evm/charge` MPP challenge (for example `stripe/charge`) with a clear, actionable message instead of a misleading USDC-terms mismatch: a Stripe Shared Payment Token is a card credential this wallet-based skill does not mint, so it points you to `facet_buy` on the merchant's own rail. Guarded by the new exported `assertMppMethodEvm`, unit-tested both directions.
+
+### Changed
+- `facet_buy` is now a 2-step commit on the Boson escrow rail: a `settle` commits the funds and then ARMS the deferred redeem in the same call, so the merchant is cleared to fulfil and the escrow can pay out on their fulfillment signal. An un-armed deferred commit would sit on-hold and never ship. Arming is best-effort and reports `armed` plus `arm_skipped`; the funds are already committed, so an arm the store will not hold never fails the buy. Dry runs and x402 buys are unchanged. The buyer keeps the escrow's cancel, dispute, and timeout recourse, and the armed set is surfaced in the result and provenance so the release trigger is auditable.
+- `facet_redeem_on_fulfillment` is reframed as the manual re-arm: `facet_buy` arms automatically, so this is for re-arming a specific `exchange_id` (for example one reported in `arm_skipped`) or a redeem deliberately held.
+- Refund guidance now leads with reading the live on-chain exchange state before claiming a line is refundable, cancellable, or disputable: the agent reads each line's `exchange_state` with `facet_lines` and gates the action on it, rather than reasoning from the rail or memory.
+- Post-delivery refund docs now state that a send-back is approved by the merchant in a Coinbase authorization window: on approval the merchant signs a gasless USDC transfer from its own payout wallet (an x402 `pay_to`) or Coinbase Smart Wallet treasury (a completed Boson leg), which Facet relays. Non-custodial on both sides; a buyer's `facet_refund` stays a request the merchant approves out of band.
+- The rendered receipt's header logo is larger, with a live cursor on the brandmark.
+- MPP (mpp.dev) docs now describe both charge methods: `evm/charge` (the on-chain USDC settlement this wallet skill signs, straight to the merchant's payout wallet) and `stripe/charge` (a Stripe Shared Payment Token that settles as a direct, non-custodial charge on the merchant's own connected Stripe account, captured and refundable, validated live on production). The docs previously framed MPP as on-chain x402 only.
+
+### Fixed
+- `facet_buy` now arms a PER-LINE Boson cart's deferred redeem correctly. The 2-step commit-and-arm detected a per-line cart (one voucher per line) but armed it on the single-voucher store, where per-line exchanges never appear, so the arm silently no-op'd and the order sat on-hold with no held redeem for the merchant's fulfillment webhook to fire. A per-line cart now arms the whole line set (delivery voucher included) in one deferred call on the per-line route (`redeem_line_items` with `defer:true`), which is site-bound and buyer-direct, the same route and auth the immediate per-line redeem uses; a single-voucher cart still arms on the pooled store. The arm route is chosen from the buy result (`classifyBuyArm`): a per-line cart by its `perline:` settlement id or line `exchange_ids`, a single-voucher Boson buy by its rail and settlement id, with x402 and dry runs left untouched. Requires a Terminal with per-line deferred-redeem storage; where it is absent the arm is reported in `arm_skipped` and never fails the buy.
+- A single-line cancel and `facet_lines` now resolve correctly for a settled per-line order, so the agent takes the right cancel route instead of retrying one that fails.
+
+## [1.3.9] - 2026-08-21
+
+### Added
+
+- `facet_redeem_on_fulfillment` MCP tool: arm release-on-fulfillment for a just-committed Boson order by pre-storing a locally-signed deferred boson-redeem, so the merchant's fulfillment webhook releases the escrow. Routes through the Facet platform's originated-redeem relay for a first-party merchant (which supplies the RFC 9421 co-signature the redeem store requires, since the store is bound to the platform origin that committed the exchange) and buyer-direct otherwise. Opt-in and lower buyer protection than confirming receipt yourself with `facet_redeem`. In-process, non-custodial (the wallet key signs locally and never leaves the process).
+- `facet_live_stores` MCP tool and a `stores` command: browse the public Facet store directory (merchants with a live Terminal) by query, without having to name a specific host first.
+- Per-line Boson escrow: when a checkout advertises per-line fees, the buyer commits one escrow voucher per line (goods, delivery) instead of a single voucher for the whole cart, so an individual line can later be redeemed, cancelled, or disputed on its own.
+- Per-line lifecycle on the CLI: `cancel`, `redeem`, and `dispute` accept `--exchange-ids` to act on a selection of a multi-line order's vouchers at once, routed through the per-line routes (the MCP path already did).
+- SKILL.md: an ordered walkthrough of the dispute-driven partial refund (refund one delivered line, keep the rest) under "After the purchase", chaining redeem, `facet_dispute`, `facet_refund` (with `items`), the merchant approve, `facet_resolve`, and `facet_withdraw` in the sequence a post-delivery Boson escrow split requires. Calls out the two easy-to-miss preconditions: the dispute path opens only after the exchange is redeemed, and the buyer's refunded share is withdrawn from Boson available-funds to the wallet.
+
+### Changed
+
+- Rail-accurate buyer protection: the post-purchase summary relays `buyer_protection.recourse` per rail instead of promising escrow for every order. A Boson order holds the funds and releases on fulfillment (cancel before it ships, dispute after); an x402-direct order is the merchant's money on settlement, so its recourse is a Terminal refund request against the receipt.
+- Documentation leads with the MCP server as the agent-facing surface and demotes the CLI to the implementation the tools spawn.
+
+### Fixed
+
+- Receipt render: line items now show for platform-originated orders, and the shareable receipt page renders gracefully with no JavaScript.
+- Receipt render: the compact JWS and JOSE snippet boxes are server-rendered too, so the receipt is complete without any client-side script.
+
 ## [1.3.0] - 2026-08-20
 
 ### Added
