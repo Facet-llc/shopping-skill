@@ -1295,9 +1295,11 @@ export const TOOLS: ToolDef[] = [
       "The reversal tools (facet_cancel / facet_withdraw / facet_dispute) already archive it " +
       "inline; use this to re-fetch it, or to fetch one performed earlier in the same wallet-bound " +
       "identity. kind is one of cancel / withdraw / dispute / refund; pass exchange_id for cancel / " +
-      "withdraw / dispute, or order_id for a refund. Owner-scoped at the Terminal: it resolves only " +
-      "for the identity that performed the reversal (a 404 otherwise, never a leak). Returns the " +
-      "receipt and its verified flag; never a key.",
+      "withdraw / dispute, or order_id for a refund. Owner-scoped at the Terminal: it resolves for " +
+      "the identity that performed the reversal, and for a REFUND additionally for the buyer who " +
+      "proves control of the order's payer wallet (so a buyer can pull their own refund receipt on " +
+      "a platform-originated order); a cancel / withdraw / dispute stays strictly owner-only (a 404 " +
+      "otherwise, never a leak). Returns the receipt and its verified flag; never a key.",
     inputSchema: obj({ terminal: S, kind: S, exchange_id: S, order_id: S, wallet: S }, [
       "terminal",
       "kind",

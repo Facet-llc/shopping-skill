@@ -54,6 +54,7 @@ import {
   isFirstPartyTarget,
   postSingleCancel,
   receiptsDir,
+  refundReversalFromReceipt,
   type ReorderLineItem,
   resolveReorderCandidates,
   signBosonAction,
@@ -1618,4 +1619,52 @@ Deno.test("postSingleCancel: a non-404 failure is returned unchanged (no retry)"
   } finally {
     globalThis.fetch = original;
   }
+});
+
+// ---------------------------------------------------------------------------
+// refundReversalFromReceipt: turn a live-fetched refund lifecycle receipt into an
+// order-level Amendment so a refund appends to the purchase receipt. Pure decode of
+// the receipt's own signed event block; no network, no key.
+// ---------------------------------------------------------------------------
+
+function jwsWithEvent(event: Record<string, unknown>): string {
+  const enc = (o: unknown) =>
+    btoa(JSON.stringify(o)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return `${enc({ typ: "facet-lifecycle+jws", alg: "EdDSA" })}.${enc({ event })}.sig`;
+}
+
+Deno.test("refundReversalFromReceipt: builds a refund Amendment from the signed event block", () => {
+  const jws = jwsWithEvent({
+    kind: "refund",
+    rail: "coin/boson-escrow",
+    order_id: "d0427513-b0a5-4260-85bc-701a15e40312",
+    refund_id: "0212b68c-596f-4c8a-87e8-be2b6895ed69",
+    amount_minor: 1624,
+    tx_hash: "0x74a7f1d5",
+  });
+  const rev = refundReversalFromReceipt({ jws }, "d0427513-b0a5-4260-85bc-701a15e40312", true);
+  assert(rev !== null);
+  assertEquals(rev!.kind, "refund");
+  // Keys on the refund id when present (a merchant refund has no per-line escrow handle).
+  assertEquals(rev!.exchange_id, "0212b68c-596f-4c8a-87e8-be2b6895ed69");
+  assertEquals(rev!.amount_minor, 1624);
+  assertEquals(rev!.signatures?.length, 1);
+  assertEquals(rev!.signatures?.[0]?.jws, jws);
+  assertEquals(rev!.signatures?.[0]?.tx_hash, "0x74a7f1d5");
+  assertEquals(rev!.signatures?.[0]?.verified, true);
+});
+
+Deno.test("refundReversalFromReceipt: falls back to the order id when the event carries no refund id", () => {
+  const jws = jwsWithEvent({ kind: "refund", amount_minor: 500, tx_hash: "0xabc" });
+  const rev = refundReversalFromReceipt({ jws }, "order-uuid", false);
+  assertEquals(rev!.exchange_id, "order-uuid");
+  assertEquals(rev!.signatures?.[0]?.verified, false);
+});
+
+Deno.test("refundReversalFromReceipt: omits amount_minor when the event has none, and needs a JWS", () => {
+  const noAmount = refundReversalFromReceipt({ jws: jwsWithEvent({ kind: "refund" }) }, "o", true);
+  assertEquals(noAmount!.amount_minor, undefined);
+  // No JWS to embed -> nothing to render, so no Amendment.
+  assertEquals(refundReversalFromReceipt({}, "o", true), null);
+  assertEquals(refundReversalFromReceipt({ jws: "" }, "o", true), null);
 });

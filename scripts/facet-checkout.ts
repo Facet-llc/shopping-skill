@@ -4497,6 +4497,25 @@ async function walletSignaturesAuth(
   return { wallet, issued_at, nonce, signature };
 }
 
+// The get_lifecycle_receipt counterpart of walletReceiptAuth. Signs the DISTINCT
+// lifecycle-refetch challenge, so a buyer can fetch their own REFUND receipt on a
+// platform-originated order (owned by an origin aid, never the buyer) by proving
+// control of the order's payer wallet. Must match the Terminal's
+// lifecycleRefetchChallenge exactly. The key never leaves this process.
+async function walletLifecycleAuth(
+  walletKey: string,
+  orderId: string,
+): Promise<Record<string, unknown>> {
+  const account = privateKeyToAccount(walletKey as `0x${string}`);
+  const wallet = account.address;
+  const issued_at = Math.floor(Date.now() / 1000);
+  const nonce = crypto.randomUUID();
+  const message =
+    `Facet lifecycle refetch\norder: ${orderId}\nwallet: ${wallet}\nissued_at: ${issued_at}\nnonce: ${nonce}`;
+  const signature = await account.signMessage({ message });
+  return { wallet, issued_at, nonce, signature };
+}
+
 // Verify a receipt OFFLINE with a stock JOSE library. The trust anchor is the
 // host you transacted with (`trustedOrigin`), NOT the receipt: we require the
 // SIGNED `iss` to equal that origin and pin the JWKS to it, so a receipt can
@@ -4695,10 +4714,15 @@ async function fetchLifecycleReceipt(
   base: string,
   lookup: LifecycleLookup,
   kya: string,
+  walletAuth?: Record<string, unknown>,
 ): Promise<{ entry: ReceiptEntry | null; note: string; status: number }> {
   const body: Record<string, unknown> = { kind: lookup.kind };
   if (lookup.orderId !== undefined) body.order_id = lookup.orderId;
   if (lookup.exchangeId !== undefined) body.exchange_id = lookup.exchangeId;
+  // Wallet-authorized re-fetch: prove control of the order's payer wallet when the
+  // purchase KYA is gone, or the order is platform-owned (an origin aid, never the
+  // buyer). The Terminal opens this path only for a REFUND (an order-stamped payer).
+  if (walletAuth !== undefined) body.wallet_auth = walletAuth;
   try {
     const r = await fetch(`${base}/v1/get_lifecycle_receipt`, {
       method: "POST",
@@ -4819,8 +4843,24 @@ async function fetchVerifySaveLifecycle(
   base: string,
   lookup: LifecycleLookup,
   kya: string,
+  walletKey?: string,
 ): Promise<Record<string, unknown>> {
-  const { entry, note: rnote } = await fetchLifecycleReceipt(base, lookup, kya);
+  let { entry, note: rnote, status } = await fetchLifecycleReceipt(base, lookup, kya);
+  // Payer-wallet fallback for a REFUND receipt on a platform-originated order (owned by
+  // an origin aid, never the buyer): the aid path 404s, so re-authorize by proving
+  // control of the order's payer wallet, exactly as the receipt / signatures re-fetch
+  // do. Refund-only: the Terminal opens the wallet path solely for an order-stamped
+  // payer, so a cancel / withdraw / dispute (exchange-id keyed, no order) stays owner-only.
+  if (
+    entry === null &&
+    (status === 403 || status === 404) &&
+    walletKey !== undefined &&
+    lookup.kind === "refund" &&
+    lookup.orderId !== undefined
+  ) {
+    const walletAuth = await walletLifecycleAuth(walletKey, lookup.orderId);
+    ({ entry, note: rnote, status } = await fetchLifecycleReceipt(base, lookup, kya, walletAuth));
+  }
   if (entry === null) {
     return { available: false, note: rnote };
   }
@@ -4841,10 +4881,12 @@ async function fetchVerifySaveLifecycle(
 // lifecycle-receipt: fetch + verify + archive a signed REVERSAL receipt on demand
 // (the cancel / withdraw / dispute / refund analogue of `receipt`). Looked up by the
 // caller-held handle: --exchange-id for cancel / withdraw / dispute, --order-id for a
-// refund, plus --kind. The Terminal owner-scopes this to a 404 with NO wallet-auth
-// fallback, so it resolves only for the identity that performed the reversal. The
-// reversal commands already archive it inline; use this to re-fetch it, or to fetch
-// one performed earlier in the same wallet-bound identity.
+// refund, plus --kind. Owner-scoped at the Terminal. A REFUND additionally re-fetches
+// by payer wallet (walletLifecycleAuth) when the aid path 404s, so a buyer can pull
+// their own refund receipt on a platform-originated order (owned by an origin aid,
+// never the buyer); a cancel / withdraw / dispute has no order-stamped payer and stays
+// strictly owner-only. The reversal commands already archive it inline; use this to
+// re-fetch it, or to fetch one performed earlier in the same wallet-bound identity.
 async function cmdLifecycleReceipt(flags: Record<string, string | boolean>): Promise<never> {
   const base = terminalBase(requireFlag(flags, "terminal"));
   const kind = requireFlag(flags, "kind");
@@ -4864,7 +4906,7 @@ async function cmdLifecycleReceipt(flags: Record<string, string | boolean>): Pro
     ...(exchangeId !== undefined ? { exchangeId } : {}),
   };
   note(`POST ${base}/v1/get_lifecycle_receipt for ${kind} ${exchangeId ?? orderId}`);
-  const receipt = await fetchVerifySaveLifecycle(base, lookup, kya);
+  const receipt = await fetchVerifySaveLifecycle(base, lookup, kya, wallet.key);
   emit({
     ok: receipt.available !== false,
     kind,
@@ -4896,6 +4938,40 @@ interface ReversalEntry {
   signatures?: Array<
     { kind: string; jws: string; kid?: string; tx_hash?: string; verified?: boolean | null }
   >;
+}
+
+/** Build an order-level refund Amendment from a live-fetched refund lifecycle receipt.
+ *  Pure: decodes the receipt's own signed `event` block (refund_id, amount_minor, tx_hash)
+ *  and carries the JWS + the caller-computed offline-verify flag, so the Amendment travels
+ *  with its own proof exactly as an archived per-line reversal does. `exchange_id` keys on
+ *  the refund id when present (else the order id), since a merchant refund has no per-line
+ *  escrow handle. Returns null when the entry has no JWS to embed. */
+export function refundReversalFromReceipt(
+  entry: ReceiptEntry,
+  orderId: string,
+  verified: boolean,
+): ReversalEntry | null {
+  if (typeof entry.jws !== "string" || entry.jws === "") return null;
+  const evClaims = b64urlToJson((entry.jws.split(".")[1]) ?? "");
+  const ev = (evClaims.event ?? {}) as {
+    refund_id?: unknown;
+    amount_minor?: unknown;
+    tx_hash?: unknown;
+  };
+  const txHash = typeof ev.tx_hash === "string" && ev.tx_hash !== "" ? ev.tx_hash : undefined;
+  const handle = typeof ev.refund_id === "string" && ev.refund_id !== "" ? ev.refund_id : orderId;
+  return {
+    kind: "refund",
+    exchange_id: handle,
+    name: "Refund",
+    ...(typeof ev.amount_minor === "number" ? { amount_minor: ev.amount_minor } : {}),
+    signatures: [{
+      kind: "refund",
+      jws: entry.jws,
+      ...(txHash !== undefined ? { tx_hash: txHash } : {}),
+      verified,
+    }],
+  };
 }
 
 /** Read an archived signed lifecycle (reversal) receipt for one exchange, if the
@@ -5192,6 +5268,32 @@ async function cmdRenderReceipt(flags: Record<string, string | boolean>): Promis
   // Amendments section + a Net-now line. Archive-driven (no live call), so it works
   // after settlement; an order with no archived escrow lines omits the section.
   const reversals = discoverReversals(orderId, items);
+
+  // Live refund reversal: the archive only holds reversals the buyer performed through
+  // this skill, so a MERCHANT-approved refund (or one settled out of band) is absent.
+  // Fetch the order's signed refund receipt live and append it, so a refund appends to
+  // the purchase receipt for any order. Owner-scoped with the SAME payer-wallet fallback
+  // as the receipt itself: a platform-originated order is owned by an origin aid, so the
+  // buyer re-authorizes with the paying wallet when the aid path refuses. Deduped by tx
+  // hash so it never double-counts a reversal the archive already carries. Best effort:
+  // a refund that cannot be fetched just omits the Amendment; the receipt still renders.
+  try {
+    let lc = await fetchLifecycleReceipt(base, { kind: "refund", orderId }, buyKya);
+    if (lc.entry === null && (lc.status === 403 || lc.status === 404)) {
+      const walletAuth = await walletLifecycleAuth(wallet.key, orderId);
+      lc = await fetchLifecycleReceipt(base, { kind: "refund", orderId }, buyKya, walletAuth);
+    }
+    if (lc.entry !== null) {
+      const verdict = await verifyReceipt(lc.entry, iss, FACET_LIFECYCLE_TYP);
+      const rev = refundReversalFromReceipt(lc.entry, orderId, verdict.verified === true);
+      const txHash = rev?.signatures?.[0]?.tx_hash;
+      const already = txHash !== undefined &&
+        reversals.some((rv) => rv.signatures?.some((s) => s.tx_hash === txHash));
+      if (rev !== null && !already) reversals.push(rev);
+    }
+  } catch {
+    // Best effort: the purchase receipt renders without the live refund Amendment.
+  }
 
   // Read the official template and fill it.
   const templatePath = new URL("../references/receipt-template.html", import.meta.url);
