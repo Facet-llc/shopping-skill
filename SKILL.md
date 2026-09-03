@@ -223,17 +223,13 @@ The browser is for looking, not buying. Use it to browse and select only. Never 
 
 ### The agent-ready mark (small cue)
 
-Facet's agent-ready mark is a tiny green terminal prompt with a blinking cursor, embedded as a self-contained data-URI SVG. Use the embedded form, NOT a hosted URL: a hosted image renders as a "Show Image" placeholder in the chat surface, while an embedded data-URI renders and blinks directly. Show it as a markdown image immediately before the message text at exactly three moments, and nowhere else. In this chat surface a markdown image takes its own line, so the mark renders as a small animated badge directly above the message; that stacked placement is expected and accepted (inline HTML would sit to the left of the text on the same line, but this surface strips it).
+Facet's agent-ready mark is a tiny green terminal prompt with a blinking cursor, embedded as a self-contained data-URI SVG. You never type the data-URI yourself: it is provided to you IN THE TOOL RESULT as the `agent_ready_badge` field, because it is roughly 700 characters and reproducing it from this doc truncates it into a broken image. The `facet_discover`, held-quote `facet_buy` (DRY), and settled `facet_buy` (SETTLE) results each carry an `agent_ready_badge` field. At exactly these three moments, and nowhere else, copy that field's value verbatim from the tool result and place it at the very start of your message, then a space, then your text:
 
-1. Agent-ready (step 3): the "this store is agent-ready" line, once `facet_discover` confirms a `Terminal`.
-2. The held reservation (step 7): the line that presents the DRY quote total (for example "Reservation held. Here is the exact total...").
-3. Order completion (step 8): the settlement line that hands over the receipt (for example "Purchase complete. Here is your receipt.").
+1. Agent-ready (step 3): the "this store is agent-ready" line. Source: the `agent_ready_badge` in the `facet_discover` result.
+2. The held reservation (step 7): the line that presents the DRY quote total (for example "Reservation held. Here is the exact total..."). Source: the `agent_ready_badge` in the DRY `facet_buy` result.
+3. Order completion (step 8): the settlement line that hands over the receipt (for example "Purchase complete. Here is your receipt."). Source: the `agent_ready_badge` in the settled `facet_buy` result.
 
-At each of those moments, prepend this EXACT markdown image, then a space, then your message. Copy the string verbatim, every character; do not shorten it, re-encode it, or swap in the hosted URL. If you cannot reproduce it exactly, omit the mark rather than emit a broken image:
-
-`![agent ready](data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgd2lkdGg9IjIwIiBoZWlnaHQ9IjIwIj48cmVjdCB4PSIzIiB5PSIzIiB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHJ4PSI0LjUiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzE2YTM0YSIgc3Ryb2tlLXdpZHRoPSIxLjUiLz48cG9seWxpbmUgcG9pbnRzPSI3LDcuOCA5LjMsOS45IDcsMTIiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzE2YTM0YSIgc3Ryb2tlLXdpZHRoPSIxLjgiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPjxsaW5lIHgxPSIxMS41IiB5MT0iMTIiIHgyPSIxNC41IiB5Mj0iMTIiIHN0cm9rZT0iIzE2YTM0YSIgc3Ryb2tlLXdpZHRoPSIxLjgiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCI+PGFuaW1hdGUgYXR0cmlidXRlTmFtZT0ib3BhY2l0eSIgdmFsdWVzPSIxOzA7MSIga2V5VGltZXM9IjA7MC41OzEiIGR1cj0iMS4xcyIgY2FsY01vZGU9ImRpc2NyZXRlIiByZXBlYXRDb3VudD0iaW5kZWZpbml0ZSIvPjwvbGluZT48L3N2Zz4=)`
-
-Do not resize it, and never show it on a non-Facet store or per product row. The cursor blinks where the surface animates SVG images and shows a static green mark otherwise; both are fine. The hosted `https://facet.llc/badge/agent-ready.svg` and the iframe embed stay for storefront and website use; the chat cue uses the embedded data-URI above.
+Copy the field value exactly as given (it is already a complete markdown image); do not retype it from memory, shorten it, re-encode it, or swap in a hosted URL. If a result has no `agent_ready_badge` field, omit the mark rather than invent one. In this chat surface a markdown image takes its own line, so the mark renders as a small animated badge directly above the message; that stacked placement is expected and accepted. Do not resize it, and never show it on a non-Facet store or per product row. The hosted `https://facet.llc/badge/agent-ready.svg` and the iframe embed stay for storefront and website use.
 
 ### Browsing the storefront (drive it live, do not just describe it)
 
