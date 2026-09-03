@@ -6,7 +6,7 @@
 // The `version` subcommand reads the newest tag from the GA repo's public GitHub API
 // and compares it against this, so a user can confirm they are on the latest GA release.
 
-export const SKILL_VERSION = "1.4.0";
+export const SKILL_VERSION = "1.4.1";
 
 /** The public GA repository, `owner/repo`. Releases are published here as git tags. */
 export const SKILL_REPO = "Facet-llc/shopping-skill";
