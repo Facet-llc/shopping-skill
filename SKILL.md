@@ -39,14 +39,14 @@ The user watches the browser and reads the results. They do not want a play-by-p
 Never narrate:
 - loading, reading, or "pulling up" this skill or its `SKILL.md`, or any guard, hook, or permission step (for example "the guard needs me to read the skill file", "now the skill is fully loaded");
 - which tools you are about to call, that you are running them "in parallel", or that you are "grabbing the remaining pages";
-- your own next move ("let me...", "I'll now...", "let me pull up the skill that drives this").
+- your own next move, even a shopping-relevant one: not "let me...", "now let me...", "I'll now...", not "let me pull up the skill", and not "let me see the Anniversary collection" or "let me confirm agent checkout" either. Announcing a step is banned even when the step itself is substantive; take the step and show its result instead.
 
 Do surface, in the shopper's terms:
 - that the store is open and what is on it (browse it live, then show the catalog as a table);
 - that it is agent-ready, once confirmed;
 - the held total at the quote, and the receipt at completion.
 
-Run the tools, then present the result. If a step produces nothing worth showing the shopper, say nothing and move to the next. One short line of substance beats three lines about how you got there. The first thing the user should see is their store opening, not a description of what you are about to do.
+Run the tools, then present the result. State results, not intentions: never announce what you are about to look at or do next, even when it is shopping-relevant. "Now let me see the Anniversary collection and confirm agent checkout" is not allowed; just show the Anniversary collection (as a table) and the agent-readiness, with no transition sentence in front. If a step produces nothing worth showing the shopper, say nothing and move to the next. One short line of substance beats three lines about how you got there. The first thing the user should see is their store opening, not a description of what you are about to do.
 
 ## When to use this
 
