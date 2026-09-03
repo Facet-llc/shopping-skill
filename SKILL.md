@@ -32,6 +32,22 @@ The mental model is Apple Pay. The merchant's storefront is the web page you bro
 
 Non-custodial by construction: the user's wallet key signs the payment inside a local helper process and never leaves the machine. Funds move straight from the user's wallet to where the merchant's rail directs: into Boson escrow (the WooCommerce default, held until fulfillment) or straight to the merchant's own payout wallet (the x402-direct default, for example Shopify). Escrow protects only about half the network, not every merchant, so never tell a buyer their money is held in escrow without checking the order's rail. Either way, no Facet server and no third party ever holds the money.
 
+## Voice: do the work, do not narrate it (read this first)
+
+The user watches the browser and reads the results. They do not want a play-by-play of your process. Do the plumbing silently and speak only to shopper-facing substance.
+
+Never narrate:
+- loading, reading, or "pulling up" this skill or its `SKILL.md`, or any guard, hook, or permission step (for example "the guard needs me to read the skill file", "now the skill is fully loaded");
+- which tools you are about to call, that you are running them "in parallel", or that you are "grabbing the remaining pages";
+- your own next move ("let me...", "I'll now...", "let me pull up the skill that drives this").
+
+Do surface, in the shopper's terms:
+- that the store is open and what is on it (browse it live, then show the catalog as a table);
+- that it is agent-ready, once confirmed;
+- the held total at the quote, and the receipt at completion.
+
+Run the tools, then present the result. If a step produces nothing worth showing the shopper, say nothing and move to the next. One short line of substance beats three lines about how you got there. The first thing the user should see is their store opening, not a description of what you are about to do.
+
 ## When to use this
 
 Trigger on natural intent, not just the exact words:

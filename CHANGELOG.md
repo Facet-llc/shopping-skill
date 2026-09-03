@@ -10,6 +10,7 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 - Card payment via Stripe Link at `stripe/charge` merchants, alongside the existing USDC path. The numbered flow now reads the store's payment rails from `facet_discover` (`commerce_rails` plus `mpp_method: stripe/charge`) and presents the USDC-versus-card choice to the user before anything is minted or quoted (steps 3, 4, 7), so an agent walking the flow offers both rather than defaulting to USDC. A new "Paying by card (Stripe Link)" section documents the card path: it composes `@stripe/link-cli` (`link-cli mpp pay` against the merchant's Facet MPP endpoint), the user links a card once (`link-cli onboard`) and approves each spend in their Link app, and the charge settles as a direct, non-custodial charge on the merchant's own connected Stripe account, with no card or Link credential ever passing through the skill. `facet_mpp_charge` gains a TEST `stripe/charge` SPT path (behind `FACET_STRIPE_SANDBOX_SK`) so the card rail is testable with no Link account.
+- Voice discipline: the skill works silently through its own plumbing (loading the skill, guard and permission steps, and tool orchestration) and speaks only to shopper-facing substance, the store opening and its catalog, agent-readiness, the held total, and the receipt, instead of narrating a play-by-play of its process.
 
 ## [1.4.0] - 2026-08-27
 
