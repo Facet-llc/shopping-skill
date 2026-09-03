@@ -257,28 +257,8 @@ const PLATFORM_ORIGINATION_SUFFIXES = (Deno.env.get("FACET_PLATFORM_ORIGINATION_
 
 // ---- tiny plumbing ---------------------------------------------------------
 export const note = (m: string) => console.error("   " + m);
-// The agent-ready mark, embedded as a self-contained data-URI SVG (a green terminal
-// prompt with a blinking cursor). It is attached to the three agent-ready tool results
-// (a confirmed discovery, a held DRY quote, a settled order) so the calling agent copies
-// it VERBATIM from the adjacent tool output, rather than reproducing a ~700-char string
-// from the skill doc, which a model truncates into a broken image. Display-only: a static
-// string with no bearing on signing, funds, identity, or any money-path decision.
-export const AGENT_READY_BADGE_MD =
-  "![agent ready](data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgd2lkdGg9IjIwIiBoZWlnaHQ9IjIwIj48cmVjdCB4PSIzIiB5PSIzIiB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHJ4PSI0LjUiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzE2YTM0YSIgc3Ryb2tlLXdpZHRoPSIxLjUiLz48cG9seWxpbmUgcG9pbnRzPSI3LDcuOCA5LjMsOS45IDcsMTIiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzE2YTM0YSIgc3Ryb2tlLXdpZHRoPSIxLjgiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPjxsaW5lIHgxPSIxMS41IiB5MT0iMTIiIHgyPSIxNC41IiB5Mj0iMTIiIHN0cm9rZT0iIzE2YTM0YSIgc3Ryb2tlLXdpZHRoPSIxLjgiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCI+PGFuaW1hdGUgYXR0cmlidXRlTmFtZT0ib3BhY2l0eSIgdmFsdWVzPSIxOzA7MSIga2V5VGltZXM9IjA7MC41OzEiIGR1cj0iMS4xcyIgY2FsY01vZGU9ImRpc2NyZXRlIiByZXBlYXRDb3VudD0iaW5kZWZpbml0ZSIvPjwvbGluZT48L3N2Zz4=)";
-
-// True for exactly the three moments the badge marks: a store confirmed agent-ready
-// (facet_enabled), or a held (DRY) or settled (SETTLE) checkout. Never on an error
-// (ok === false), a non-agent-ready discovery, or any other command's result.
-function isAgentReadyMoment(obj: Record<string, unknown>): boolean {
-  if (obj.ok === false) return false;
-  return obj.facet_enabled === true || obj.mode === "DRY" || obj.mode === "SETTLE";
-}
-
 export function emit(obj: Record<string, unknown>): never {
-  const out = isAgentReadyMoment(obj) && obj.agent_ready_badge === undefined
-    ? { agent_ready_badge: AGENT_READY_BADGE_MD, ...obj }
-    : obj;
-  console.log(JSON.stringify(out));
+  console.log(JSON.stringify(obj));
   Deno.exit(obj.ok === false ? 1 : 0);
 }
 export function die(error: string, extra: Record<string, unknown> = {}): never {
