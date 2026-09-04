@@ -140,7 +140,17 @@ function prettyRail(rail: string): string {
     "coin/boson-escrow": "Boson escrow",
     "coin/usdc-base": "x402 direct",
     "coin/usdc-base-sepolia": "x402 direct",
+    "card/stripe": "Card (Stripe)",
+    "coin/usdc-stripe": "x402 direct",
   } as Record<string, string>)[rail] ?? (rail || "settlement");
+}
+
+// True for a card rail (Stripe). Card orders settle to the merchant's own Stripe
+// account, so their receipt labels the external id a "Stripe charge", not the
+// on-chain "settlement" / "Boson exchange" the crypto rails use, and its recourse
+// is a card refund, not an escrow release.
+function isCardRail(rail: string): boolean {
+  return rail.startsWith("card/");
 }
 
 const NONE = "(none)";
@@ -268,14 +278,28 @@ function itemsHtml(
 
 function settlementKv(claims: Record<string, unknown>, st: Record<string, unknown>): string {
   const rail = String(st.rail ?? "");
+  const card = isCardRail(rail);
+  // The external settlement id, labelled for the rail that produced it: a card
+  // order settles a Stripe charge on the merchant's connected account, a Boson
+  // order an on-chain escrow exchange, and x402 a direct on-chain settlement.
+  const idRow = st.settlement_id
+    ? card
+      ? kvRow("Stripe charge", esc(String(st.settlement_id)))
+      : rail === "coin/boson-escrow"
+      ? kvRow("Escrow", esc("Boson exchange " + st.settlement_id))
+      : kvRow("Settlement", esc(String(st.settlement_id)))
+    : "";
   const rows = [
     kvRow("Order", esc(claims.jti ?? NONE)),
-    st.settlement_id
-      ? kvRow("Escrow", esc((rail === "coin/boson-escrow" ? "Boson exchange " : "settlement ") + st.settlement_id))
-      : "",
-    kvRow("Rail", esc(rail || NONE)),
+    idRow,
+    kvRow("Rail", esc(prettyRail(rail) || NONE)),
     kvRow("Settled", esc(st.settled_at ?? NONE)),
-    kvRow("Livemode", st.livemode === true ? "true &#183; real USDC on Base" : "false &#183; testnet"),
+    kvRow(
+      "Livemode",
+      st.livemode === true
+        ? card ? "true &#183; real card charge" : "true &#183; real USDC on Base"
+        : card ? "false &#183; Stripe test mode" : "false &#183; testnet",
+    ),
   ];
   return rows.filter((r) => r !== "").join("\n        ");
 }
@@ -323,7 +347,13 @@ function provenanceSection(provenance: Record<string, unknown> | null | undefine
 
   const payRows: string[] = [];
   if (pay) {
-    const railName = pay.rail === "boson" ? "Boson escrow" : (pay.rail === "mpp" ? "MPP evm/charge" : "x402 direct");
+    const railName = pay.rail === "boson"
+      ? "Boson escrow"
+      : pay.rail === "mpp"
+      ? "MPP evm/charge"
+      : (pay.rail === "stripe" || pay.rail === "card")
+      ? "Card (Stripe)"
+      : "x402 direct";
     payRows.push(kvRow("Rail", esc(railName)));
     const ta = (pay.token_authorization ?? pay.authorization) as
       | { from?: string; to?: string; value?: string; nonce?: string }

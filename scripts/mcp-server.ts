@@ -597,6 +597,7 @@ function buildBuyArgv(a: Args): string[] {
   pushStr(v, "gift-message", a.gift_message);
   pushStr(v, "delivery-date", a.delivery_date);
   pushStr(v, "occasion", a.occasion);
+  pushStr(v, "rail", a.rail);
   return v;
 }
 
@@ -983,7 +984,11 @@ export const TOOLS: ToolDef[] = [
       "returns confirm_pay_to (the recipient), which must be passed back on settle: the " +
       "x402 recipient is not escrow-pinned, so it is confirmed like the amount. items is " +
       "an array of { id, qty }; ship is the shipping address object. The wallet key never " +
-      "leaves the child process.",
+      "leaves the child process. For a CARD purchase (a stripe/charge merchant) set rail to " +
+      "\"card\": the dry run holds the reservation and returns checkout_id plus the total " +
+      "WITHOUT gating on the wallet's USDC balance, because the card settles through Stripe " +
+      "Link via link-cli and spends no USDC (the wallet is only the identity). Then pay with " +
+      "link-cli mpp pay against that reservation_id; do not settle facet_buy on the card rail.",
     inputSchema: obj({
       terminal: S,
       items: { type: ["array", "string"] },
@@ -996,6 +1001,7 @@ export const TOOLS: ToolDef[] = [
       gift_message: S,
       delivery_date: S,
       occasion: S,
+      rail: S,
     }, ["terminal", "items", "ship"]),
     script: "facet-checkout.ts",
     perms: facetPerms,

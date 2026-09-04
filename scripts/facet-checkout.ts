@@ -54,6 +54,7 @@
 //   buy       --terminal <url> --items '<json>' --ship '<json>'
 //             [--gift-message "..."] [--delivery-date YYYY-MM-DD] [--occasion "..."]
 //             [--shipping-email <addr>] [--max-usdc N] [--wallet <label>] [--settle --confirm <atomic>]
+//             [--rail card]   (card: hold the reservation for Stripe Link / link-cli, no USDC-balance gate)
 //   email-pref set <address> | email-pref set --none | email-pref show
 //   redeem    --terminal <url> --exchange-id <id> [--wallet <label>]
 //   cancel    --terminal <url> --exchange-id <id> [--wallet <label>] [--withdraw] [--amount <atomic>]
@@ -94,7 +95,7 @@ import { compactVerify, createLocalJWKSet } from "npm:jose@5.9.6";
 // `Payment-Receipt` headers mpp.dev uses for the challenge and the receipt.
 import { Mppx } from "npm:mppx@0.8.17/client";
 import { charge as mppEvmCharge } from "npm:mppx@0.8.17/evm/client";
-import { Challenge as MppChallenge, Receipt as MppReceipt } from "npm:mppx@0.8.17";
+import { Challenge as MppChallenge, Credential as MppCredential, Receipt as MppReceipt } from "npm:mppx@0.8.17";
 import { cachePathFor, kyaUsable, provisionKya, readCachedKya } from "./kya-provision.ts";
 import { fillReceiptTemplate, merchantNameFromHost, pubkeyXForKid } from "./render-receipt.ts";
 import { latestTag, SKILL_TAGS_URL, SKILL_VERSION, versionReport } from "./version.ts";
@@ -1497,53 +1498,15 @@ async function cmdMppCharge(flags: Record<string, string | boolean>): Promise<ne
   const account = privateKeyToAccount(wallet.key as `0x${string}`);
   note(`buyer wallet [${wallet.label}]: ${account.address}`);
 
-  // ---- ESCROW GUARD (before anything else): MPP settles x402-direct with no
-  // escrow. If this reservation's merchant offers Boson escrow, charging via MPP
-  // would bypass the buyer protection they offer, so refuse and send the caller to
-  // `buy`. Read the merchant's OWN advertised rails from the reservation's checkout
-  // session (owner-scoped: the same wallet that reserved reads it), so the decision
-  // is per-merchant, not from the Terminal's global rail capability. FAIL CLOSED: if
-  // the rails cannot be confirmed x402-only, do not settle. The charge credential
-  // itself still carries no KYA; this read is only the guard. ----
-  const guardKya = await walletBoundKya(wallet);
-  const sessionUrl = `${base}/ucp/v1/checkout-sessions/${encodeURIComponent(reservationId)}`;
-  note(`GET ${sessionUrl}  (escrow guard: read the reservation's rails)`);
-  let sessRes: Response;
-  try {
-    sessRes = await fetch(sessionUrl, { headers: kyaHeaders(guardKya) });
-  } catch (e) {
-    die(
-      `escrow guard: could not read the reservation's checkout session ` +
-        `(${e instanceof Error ? e.message : String(e)}). Refusing to settle without confirming the ` +
-        `merchant is x402-only, to avoid bypassing escrow.`,
-    );
-  }
-  const sessText = await sessRes.text();
-  if (sessRes.status !== 200) {
-    die(
-      `escrow guard: could not read the reservation's checkout session (HTTP ${sessRes.status}). The ` +
-        `reservation must belong to this wallet [${wallet.label}]. Refusing to settle without confirming ` +
-        `the merchant is x402-only, to avoid bypassing escrow.`,
-      { http_status: sessRes.status, body: sessText.slice(0, 300) },
-    );
-  }
-  const guardSession = parseJsonObjOrDie(sessText, "checkout session") as {
-    payment_handlers?: Record<string, unknown>;
-    default_rail?: string;
-  };
-  if (mppRefusedForEscrow(guardSession.payment_handlers)) {
-    die(
-      `this merchant offers Boson escrow (buyer protection), so MPP is refused here: MPP settles ` +
-        `x402-direct with no escrow and would bypass that protection. Use \`buy\` to check out into escrow.`,
-      {
-        reason: "escrow_available_mpp_refused",
-        default_rail: typeof guardSession.default_rail === "string" ? guardSession.default_rail : null,
-        advertised_rails: Object.keys(guardSession.payment_handlers ?? {}),
-        use_instead: "buy",
-      },
-    );
-  }
-  note(`escrow guard passed: merchant is x402-only (no Boson escrow handler advertised)`);
+  // ---- ESCROW GUARD: deferred to the evm/charge path below. It protects a
+  // USDC-over-MPP charge from silently bypassing a merchant's Boson escrow, so it
+  // is only meaningful when the drawn challenge is evm/charge. A stripe/charge
+  // challenge is a card charge the merchant explicitly routes to Stripe (a
+  // different instrument, with no escrow to bypass), so we draw the challenge FIRST
+  // and run the guard only on the evm branch (just before assertMppMethodEvm). This
+  // also lets the stripe/charge path work on a first-party store, whose reservation
+  // is created via platform origination and is not readable at the merchant-direct
+  // checkout-sessions GET the guard uses. ----
 
   // The mpp.dev client. The evm/charge method's own policy (networks / currencies /
   // maxAtomicAmount) is a belt-and-suspenders check UNDER our own assertMppTerms:
@@ -1600,12 +1563,160 @@ async function cmdMppCharge(flags: Record<string, string | boolean>): Promise<ne
       body: probeText.slice(0, 400),
     });
   }
-  // This wallet skill mints only the evm/charge credential (an ERC-3009 USDC
-  // authorization). If the merchant's MPP endpoint challenges a different method,
-  // most notably stripe/charge (a Stripe Shared Payment Token that settles as a
-  // direct, non-custodial charge on the merchant's OWN connected Stripe account, a
-  // card credential this skill does not mint), refuse with a clear message rather
-  // than a misleading USDC-terms mismatch.
+  // Stripe Shared Payment Token path (method=stripe/charge): the merchant settles
+  // this order as a direct, non-custodial card charge on its OWN connected Stripe
+  // account. This skill can complete it in TEST mode by minting a test SPT, when a
+  // Stripe sandbox key (FACET_STRIPE_SANDBOX_SK, an sk_test_ key) is present. The
+  // amount and terms are server-derived from the reservation; the card credential is
+  // an SPT, not this wallet's ERC-3009 authorization, so the buyer wallet never signs
+  // here. Without the key, refuse with a clear message (no key to mint an SPT).
+  if (String(challenge.method).toLowerCase() === "stripe") {
+    const sk = Deno.env.get("FACET_STRIPE_SANDBOX_SK") ?? "";
+    if (!sk.startsWith("sk_test_")) {
+      die(
+        `this merchant settles via Stripe (method=${challenge.method}/${challenge.intent}). ` +
+          `Completing it needs a Stripe Shared Payment Token; this skill mints a TEST SPT only when ` +
+          `FACET_STRIPE_SANDBOX_SK (an sk_test_ key) is set. Set it to demo the card path, or use \`buy\`.`,
+        { method: String(challenge.method), intent: String(challenge.intent), needs: "FACET_STRIPE_SANDBOX_SK" },
+      );
+    }
+    const sreq = (challenge.request ?? {}) as { amount?: string; currency?: string };
+    const sAmountMinor = String(sreq.amount ?? "");
+    const sCurrency = String(sreq.currency ?? "usd").toLowerCase();
+    const sSummary = {
+      reservation_id: reservationId,
+      mpp_endpoint: mppEndpoint,
+      method: `${challenge.method}/${challenge.intent}`,
+      amount_minor: Number(sAmountMinor),
+      amount_display: (Number(sAmountMinor) / 100).toFixed(2),
+      currency: sCurrency,
+      settles_to: "the merchant's own connected Stripe account",
+      wallet: wallet.label,
+    };
+    if (!settle) {
+      emit({
+        ok: true,
+        mode: "DRY",
+        ...sSummary,
+        signed: false,
+        settled: false,
+        confirm_atomic: Number(sAmountMinor),
+        next: `to settle: mpp-charge --terminal ${base} --reservation-id ${reservationId} --settle --confirm ${sAmountMinor}`,
+        message: `Ready to charge ${(Number(sAmountMinor) / 100).toFixed(2)} ${sCurrency.toUpperCase()} via MPP ` +
+          `stripe/charge to the merchant's connected Stripe account (test mode). Nothing has moved. Confirm the ` +
+          `amount with the user, then settle with --confirm ${sAmountMinor}.`,
+      });
+    }
+    const sConfirm = flags.confirm;
+    if (typeof sConfirm !== "string" || Number(sConfirm) !== Number(sAmountMinor)) {
+      die(
+        `settle refused: --confirm must equal the freshly-challenged amount ${sAmountMinor} (minor units). ` +
+          `Run the DRY mpp-charge again, show the user ${(Number(sAmountMinor) / 100).toFixed(2)} ${sCurrency.toUpperCase()}, then settle.`,
+        { expected_confirm_atomic: Number(sAmountMinor) },
+      );
+    }
+    // Mint a fresh TEST SPT (platform-scoped; redeems on the connected account at
+    // settle), then wrap it in an mppx credential bound to this challenge and the
+    // reservation id, and present it as Authorization: Payment.
+    const grant = await fetch("https://api.stripe.com/v1/test_helpers/shared_payment/granted_tokens", {
+      method: "POST",
+      headers: { authorization: "Basic " + btoa(sk + ":"), "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        payment_method: "pm_card_visa",
+        "usage_limits[currency]": sCurrency,
+        "usage_limits[max_amount]": String(Math.max(Number(sAmountMinor), 100)),
+        "usage_limits[expires_at]": String(Math.floor(Date.now() / 1000) + 3600),
+      }).toString(),
+    });
+    const gj = await grant.json() as Record<string, unknown>;
+    if (grant.status !== 200) {
+      die(`Stripe SPT mint failed (HTTP ${grant.status}).`, { body: JSON.stringify(gj).slice(0, 200) });
+    }
+    const spt = gj.id as string;
+    note(`minted test Stripe SPT (${spt.slice(0, 6)}...); building credential and settling`);
+    const sCred = MppCredential.serialize(MppCredential.from({ challenge, payload: { spt, externalId: reservationId } }));
+    let sRes: Response;
+    try {
+      sRes = await mppx.rawFetch(mppEndpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: sCred },
+        body: JSON.stringify({ reservation_id: reservationId }),
+      });
+    } catch (e) {
+      die(`MPP stripe charge resubmit failed: ${e instanceof Error ? e.message : String(e)}`, { settled: "unconfirmed" });
+    }
+    const sBody = await sRes.text();
+    if (sRes.status < 200 || sRes.status >= 300) {
+      die(`MPP stripe charge refused (HTTP ${sRes.status}).`, { body: sBody.slice(0, 300) });
+    }
+    let sJson: Record<string, unknown> = {};
+    try {
+      sJson = JSON.parse(sBody);
+    } catch { /* keep the raw body in the message below */ }
+    emit({
+      ok: true,
+      mode: "SETTLE",
+      ...sSummary,
+      settled: true,
+      order_id: (sJson.order as { id?: string } | undefined)?.id ?? null,
+      settlement_id: sJson.settlement_id ?? null,
+      settled_at: sJson.settled_at ?? null,
+      payment_receipt: sRes.headers.get("Payment-Receipt") ?? null,
+      message: `Settled ${(Number(sAmountMinor) / 100).toFixed(2)} ${sCurrency.toUpperCase()} as a Stripe card ` +
+        `charge on the merchant's own connected account (test mode).`,
+    });
+  }
+
+  // ---- ESCROW GUARD (evm/charge path only): a USDC-over-MPP charge settles
+  // x402-direct with no escrow. If this reservation's merchant offers Boson escrow,
+  // charging via MPP would bypass that buyer protection, so refuse and send the
+  // caller to `buy`. Read the merchant's OWN advertised rails from the reservation's
+  // checkout session (owner-scoped: the same wallet that reserved reads it). FAIL
+  // CLOSED: if the rails cannot be confirmed x402-only, do not settle. Not reached
+  // for a stripe/charge challenge, which is handled and returned above. ----
+  const guardKya = await walletBoundKya(wallet);
+  const sessionUrl = `${base}/ucp/v1/checkout-sessions/${encodeURIComponent(reservationId)}`;
+  note(`GET ${sessionUrl}  (escrow guard: read the reservation's rails)`);
+  let sessRes: Response;
+  try {
+    sessRes = await fetch(sessionUrl, { headers: kyaHeaders(guardKya) });
+  } catch (e) {
+    die(
+      `escrow guard: could not read the reservation's checkout session ` +
+        `(${e instanceof Error ? e.message : String(e)}). Refusing to settle without confirming the ` +
+        `merchant is x402-only, to avoid bypassing escrow.`,
+    );
+  }
+  const sessText = await sessRes.text();
+  if (sessRes.status !== 200) {
+    die(
+      `escrow guard: could not read the reservation's checkout session (HTTP ${sessRes.status}). The ` +
+        `reservation must belong to this wallet [${wallet.label}]. Refusing to settle without confirming ` +
+        `the merchant is x402-only, to avoid bypassing escrow.`,
+      { http_status: sessRes.status, body: sessText.slice(0, 300) },
+    );
+  }
+  const guardSession = parseJsonObjOrDie(sessText, "checkout session") as {
+    payment_handlers?: Record<string, unknown>;
+    default_rail?: string;
+  };
+  if (mppRefusedForEscrow(guardSession.payment_handlers)) {
+    die(
+      `this merchant offers Boson escrow (buyer protection), so MPP is refused here: MPP settles ` +
+        `x402-direct with no escrow and would bypass that protection. Use \`buy\` to check out into escrow.`,
+      {
+        reason: "escrow_available_mpp_refused",
+        default_rail: typeof guardSession.default_rail === "string" ? guardSession.default_rail : null,
+        advertised_rails: Object.keys(guardSession.payment_handlers ?? {}),
+        use_instead: "buy",
+      },
+    );
+  }
+  note(`escrow guard passed: merchant is x402-only (no Boson escrow handler advertised)`);
+
+  // Otherwise this wallet skill mints the evm/charge credential (an ERC-3009 USDC
+  // authorization). Any other method it cannot mint, so refuse with a clear message
+  // rather than a misleading USDC-terms mismatch.
   try {
     assertMppMethodEvm(String(challenge.method), String(challenge.intent));
   } catch (e) {
@@ -1988,6 +2099,62 @@ async function cmdBuy(flags: Record<string, string | boolean>): Promise<never> {
     // total the buyer was shown; the pooled path never reads it.
     totals?: unknown;
   };
+
+  // Card reservation (Stripe Link, settled by link-cli). A card buyer settles off
+  // the on-chain rails entirely, so hold the priced reservation and return its
+  // checkout_id plus the server-derived total WITHOUT selecting an on-chain rail,
+  // pre-signing a USDC transfer, or gating on the wallet's USDC balance. On this
+  // rail the wallet is only the buyer's IDENTITY (a wallet-bound KYA), never the
+  // funding source, so blocking the reservation on USDC balance is exactly the
+  // coupling this removes. link-cli cannot mint the reservation itself (it carries
+  // no Facet KYA), which is why the hold runs through facet_buy here.
+  if (flags.rail === "card") {
+    const totalMinor = ucpTotalMinor(session.totals);
+    if (totalMinor === null) {
+      die("could not read the reservation total from the checkout session (no UCP `total` entry).");
+    }
+    const totalEntry = Array.isArray(session.totals)
+      ? (session.totals as Array<Record<string, unknown>>).find(
+        (t) => t !== null && typeof t === "object" && t.type === "total",
+      )
+      : undefined;
+    const currencyRaw = totalEntry?.currency;
+    const currency = typeof currencyRaw === "string" ? currencyRaw.toUpperCase() : undefined;
+    emit({
+      ok: true,
+      mode: "DRY",
+      dry: true,
+      settled: false,
+      rail: "card/stripe",
+      checkout_id: session.id,
+      reservation_id: session.id,
+      total_minor: totalMinor,
+      total: totalMinor / 100,
+      ...(currency !== undefined ? { currency } : {}),
+      buyer: account.address,
+      items,
+      ...(hasOrderAttributes ? { order_attributes: orderAttributes } : {}),
+      shipping_email_pref: shippingEmailSignal,
+      buyer_protection: {
+        rail: "card/stripe",
+        escrow: false,
+        summary:
+          "This card charge settles to the merchant's own connected Stripe account. It is " +
+          "NOT held in escrow; the charge is the merchant's on capture.",
+        recourse:
+          "If something is wrong, open a refund request through the Terminal against your " +
+          'receipt (`refund --order-id <id> --reason "..."`); the merchant reviews and approves.',
+      },
+      next: `pay by card: link-cli mpp pay ${base}/mpp/v1/charges --method POST --data ` +
+        `'{"reservation_id":"${session.id}"}' --context "<what the user is buying and why, 100+ chars>"`,
+      message: `Reservation held for card: ${(totalMinor / 100).toFixed(2)}${
+        currency !== undefined ? " " + currency : ""
+      } for ${items.length} item(s). No USDC is spent on the card rail (the wallet is only ` +
+        `the identity). Confirm the total with the user, then pay by card with link-cli mpp ` +
+        `pay against reservation ${session.id}.`,
+    });
+  }
+
   const handlers = session.payment_handlers ?? {};
   const x402cfg = handlers[X402_HANDLER]?.[0]?.config;
   const boson = handlers[BOSON_HANDLER]?.[0]?.config;
