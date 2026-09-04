@@ -46,6 +46,7 @@
 
 import {
   DISPUTE_ACTION_ID,
+  fetchVerifySaveLifecycle,
   isFirstPartyTarget,
   kyaHeaders,
   PLATFORM_TERMINAL_URL,
@@ -321,10 +322,140 @@ async function runPerLineEscrowAction(kind: PerLineKind, args: Args): Promise<Mc
       body: JSON.stringify({ [perLineBodyKey(kind)]: items }),
     });
     const text = await response.text();
-    return terminalResponseResult(response.status, response.ok, text, `the ${kind} set request`);
+    const result = terminalResponseResult(
+      response.status,
+      response.ok,
+      text,
+      `the ${kind} set request`,
+    );
+
+    // On a successful per-line CANCEL, record the reversal locally so the settlement
+    // receipt renders EVERY cancelled line (a full cancel then reads Net now = $0),
+    // not just the one line the single-action path happens to archive. Two writes,
+    // both strictly best-effort: the cancel already happened on-chain, so neither a
+    // receipt-fetch miss nor a write-permission gap may ever turn a successful cancel
+    // into a failure. Only cancel does this; redeem / dispute are left untouched.
+    if (kind === "cancel" && response.ok) {
+      const body = parseObjectOrNull(text);
+      if (body !== null && body.ok !== false) {
+        const cancelled = cancelledExchangeIdsFromResponse(body, plan.exchangeIds);
+        // PART 1: fetch + verify + archive each cancelled line's signed cancel
+        // lifecycle receipt, through the same path the single-action cancel uses, so
+        // discoverReversals can fold in each line's verified signatures at render.
+        await archivePerLineCancelReceipts(base, kya, cancelled);
+        // PART 2: mark each cancelled line's archived escrow-line status, so the
+        // receipt renders the line even before its signed receipt anchors (and a
+        // historical order can be repaired by a later cancel or re-run).
+        markCancelledLinesInArchive(cancelled);
+      }
+    }
+    return result;
   } catch (e) {
     return textResult({ ok: false, error: e instanceof Error ? e.message : String(e) }, true);
   }
+}
+
+// From a per-line SET cancel response, the exchange ids that actually cancelled. The
+// Terminal echoes a per-line lines[] array; when it is present, drop any line
+// explicitly marked failed and keep the rest. When there is no per-line detail, fall
+// back to every requested id (the top-level response already reported success). Pure,
+// so it is unit-tested; defensive by design (only an explicit failure marker drops a
+// line, so an unrecognized shape never silently loses a cancelled line).
+export function cancelledExchangeIdsFromResponse(
+  body: Record<string, unknown> | null,
+  requested: string[],
+): string[] {
+  const lines = body !== null && Array.isArray(body.lines) ? body.lines : null;
+  if (lines === null) return [...requested];
+  const failed = new Set<string>();
+  for (const ln of lines) {
+    if (ln === null || typeof ln !== "object") continue;
+    const o = ln as Record<string, unknown>;
+    const id = typeof o.exchange_id === "string" ? o.exchange_id : String(o.exchange_id ?? "");
+    if (id === "") continue;
+    const status = String(o.status ?? o.state ?? "").toLowerCase();
+    if (o.ok === false || status === "failed" || status === "error" || status === "rejected") {
+      failed.add(id);
+    }
+  }
+  return requested.filter((id) => !failed.has(id));
+}
+
+// Best-effort: fetch + verify + archive each cancelled line's signed cancel lifecycle
+// receipt, mirroring the single-action cancel path's fetchVerifySaveLifecycle. The
+// receipt archive (lifecycle-cancel-<exchangeId>.json) is what discoverReversals folds
+// verified signatures from at render time. A receipt that has not anchored yet, a
+// transport error, or a missing write grant must NEVER fail the cancel that already
+// happened on-chain, so every call is wrapped and any problem is swallowed.
+async function archivePerLineCancelReceipts(
+  base: string,
+  kya: string,
+  exchangeIds: string[],
+): Promise<void> {
+  for (const exchangeId of exchangeIds) {
+    try {
+      await fetchVerifySaveLifecycle(base, { kind: "cancel", exchangeId }, kya);
+    } catch {
+      // Best-effort: a receipt hiccup must never read as a failed cancel.
+    }
+  }
+}
+
+// Best-effort: mark cancelled lines in the local settlement archive so a settled
+// order's receipt renders EVERY cancelled line even when the signed per-line cancel
+// receipt has not anchored yet (or was performed on another machine). The per-line
+// cancel has no order_id, so this scans the receipts dir for the settlement archive
+// file(s) whose escrow_lines carry one of the cancelled exchange ids (matched by
+// exchange_id) and sets status:"cancelled" on each matching line, preserving every
+// other field. Never throws: a read/parse/write problem on any file is skipped, and a
+// missing receipts dir yields an empty result. Returns the ids it marked, for the
+// caller's log and for unit tests. Exported so the pure archive update is testable.
+export function markCancelledLinesInArchive(exchangeIds: string[]): string[] {
+  const want = new Set(exchangeIds.filter((id) => typeof id === "string" && id !== ""));
+  if (want.size === 0) return [];
+  const dir = receiptsDir();
+  const names: string[] = [];
+  try {
+    for (const ent of Deno.readDirSync(dir)) {
+      // Order settlement archives are `<orderId>.json`; skip the lifecycle receipt
+      // files (`lifecycle-<kind>-<handle>.json`) and the index.
+      if (ent.isFile && ent.name.endsWith(".json") && !ent.name.startsWith("lifecycle-")) {
+        names.push(ent.name);
+      }
+    }
+  } catch {
+    return []; // no receipts dir, or it is unreadable
+  }
+  const marked: string[] = [];
+  for (const name of names) {
+    const path = `${dir}/${name}`;
+    let rec: { escrow_lines?: unknown };
+    try {
+      rec = JSON.parse(Deno.readTextFileSync(path)) as { escrow_lines?: unknown };
+    } catch {
+      continue; // not a parseable JSON object; skip
+    }
+    if (rec === null || typeof rec !== "object" || !Array.isArray(rec.escrow_lines)) continue;
+    let changed = false;
+    for (const line of rec.escrow_lines) {
+      if (line === null || typeof line !== "object") continue;
+      const o = line as { exchange_id?: unknown; status?: unknown };
+      const id = typeof o.exchange_id === "string" ? o.exchange_id : String(o.exchange_id ?? "");
+      if (id !== "" && want.has(id) && o.status !== "cancelled") {
+        o.status = "cancelled";
+        changed = true;
+        if (!marked.includes(id)) marked.push(id);
+      }
+    }
+    if (changed) {
+      try {
+        Deno.writeTextFileSync(path, JSON.stringify(rec, null, 2), { mode: 0o600 });
+      } catch {
+        // Best-effort: leave the file as-is if the write grant is missing.
+      }
+    }
+  }
+  return marked;
 }
 
 // The line map a `buy --settle` archived for an order (escrow_lines: each line's

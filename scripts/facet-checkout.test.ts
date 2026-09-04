@@ -49,6 +49,7 @@ import {
   chooseRail,
   type CurrentProduct,
   dedupReceiptIndex,
+  discoverReversals,
   errorReason,
   forcedRailIdFor,
   isFirstPartyTarget,
@@ -1316,6 +1317,142 @@ Deno.test("dedupReceiptIndex: latest save per order wins, newest first, corrupt 
 Deno.test("dedupReceiptIndex: empty body yields no receipts", () => {
   assertEquals(dedupReceiptIndex(""), []);
   assertEquals(dedupReceiptIndex("\n\n  \n"), []);
+});
+
+// ---------------------------------------------------------------------------
+// discoverReversals reads the settle-time order archive (no live call) and returns a
+// reversal for every line that was reversed: one with an archived signed lifecycle
+// receipt (signatures folded in, verified), OR one whose archived escrow-line status
+// is "cancelled" (a per-line SET cancel marks the status even before the signed
+// receipt anchors, and a historical order can be repaired the same way). A
+// signature-less status-only line still carries its amount, so a FULL cancel reads
+// Net now = 0 at render.
+// ---------------------------------------------------------------------------
+
+function withTempReceiptsDir(fn: (dir: string) => void): void {
+  const dir = Deno.makeTempDirSync({ prefix: "facet-reversals-test-" });
+  const prev = Deno.env.get("FACET_RECEIPTS_DIR");
+  Deno.env.set("FACET_RECEIPTS_DIR", dir);
+  try {
+    fn(dir);
+  } finally {
+    if (prev === undefined) Deno.env.delete("FACET_RECEIPTS_DIR");
+    else Deno.env.set("FACET_RECEIPTS_DIR", prev);
+    Deno.removeSync(dir, { recursive: true });
+  }
+}
+
+Deno.test("discoverReversals: a status-cancelled line with no lifecycle receipt is a signature-less reversal", () => {
+  withTempReceiptsDir((dir) => {
+    Deno.writeTextFileSync(
+      `${dir}/ord-A.json`,
+      JSON.stringify({
+        escrow_lines: [
+          {
+            exchange_id: "70",
+            sku: "HCF-BDAY",
+            name: "Birthday Arrangement",
+            amount_minor: 1500,
+            status: "cancelled",
+          },
+        ],
+      }),
+    );
+    const revs = discoverReversals("ord-A", []);
+    assertEquals(revs.length, 1);
+    assertEquals(revs[0]!.kind, "cancel");
+    assertEquals(revs[0]!.exchange_id, "70");
+    assertEquals(revs[0]!.amount_minor, 1500);
+    assertEquals(revs[0]!.name, "Birthday Arrangement");
+    // No signed receipt archived: the reversal carries an EMPTY signatures list.
+    assertEquals(revs[0]!.signatures, []);
+  });
+});
+
+Deno.test("discoverReversals: a full 3-line order all cancelled by status yields 3 signature-less reversals", () => {
+  withTempReceiptsDir((dir) => {
+    Deno.writeTextFileSync(
+      `${dir}/ord-full.json`,
+      JSON.stringify({
+        escrow_lines: [
+          { exchange_id: "1", sku: "A", name: "Goods", amount_minor: 1500, status: "cancelled" },
+          { exchange_id: "2", sku: "B", name: "Tax line", amount_minor: 124, status: "cancelled" },
+          { exchange_id: "3", sku: "C", name: "Shipping", amount_minor: 900, status: "cancelled" },
+        ],
+      }),
+    );
+    const revs = discoverReversals("ord-full", []);
+    assertEquals(revs.length, 3);
+    assert(revs.every((r) => r.kind === "cancel"), "every reversed line is a cancel");
+    assert(
+      revs.every((r) => Array.isArray(r.signatures) && r.signatures.length === 0),
+      "each status-only line is signature-less",
+    );
+    // Every line carries an amount, so the render can compute Net now (sum 2524 => 0).
+    assertEquals(revs.reduce((a, r) => a + (r.amount_minor ?? 0), 0), 2524);
+  });
+});
+
+Deno.test("discoverReversals: folds an archived signed cancel receipt, and status alone still counts", () => {
+  withTempReceiptsDir((dir) => {
+    Deno.writeTextFileSync(
+      `${dir}/ord-C.json`,
+      JSON.stringify({
+        escrow_lines: [
+          // Line 80 has a signed cancel receipt archived (no status field needed).
+          { exchange_id: "80", sku: "A", name: "Signed line", amount_minor: 500 },
+          // Line 81 has only the archived status, no signed receipt yet.
+          {
+            exchange_id: "81",
+            sku: "B",
+            name: "Status line",
+            amount_minor: 700,
+            status: "cancelled",
+          },
+        ],
+      }),
+    );
+    // The signed cancel receipt for line 80, in the shape saveLifecycleReceipt writes.
+    Deno.writeTextFileSync(
+      `${dir}/lifecycle-cancel-80.json`,
+      JSON.stringify({
+        kind: "cancel",
+        jws: "eyJhbGciOiJFZERTQQ.cancelpayload.cancelsig",
+        kid: "k1",
+        verified: true,
+        claims: { event: { tx_hash: "0xabc123" } },
+      }),
+    );
+    const revs = discoverReversals("ord-C", []);
+    assertEquals(revs.length, 2);
+    const byId = new Map(revs.map((r) => [r.exchange_id, r]));
+    // Line 80: the signed receipt is folded in (verified, tx hash carried).
+    const r80 = byId.get("80")!;
+    const sigs80 = r80.signatures ?? [];
+    assertEquals(sigs80.length, 1);
+    assertEquals(sigs80[0]!.kind, "cancel");
+    assertEquals(sigs80[0]!.verified, true);
+    assertEquals(sigs80[0]!.tx_hash, "0xabc123");
+    // Line 81: status-only, signature-less, still emitted as a reversal.
+    assertEquals(byId.get("81")!.signatures, []);
+  });
+});
+
+Deno.test("discoverReversals: a line neither signed nor status-cancelled is excluded; no archive yields none", () => {
+  withTempReceiptsDir((dir) => {
+    Deno.writeTextFileSync(
+      `${dir}/ord-D.json`,
+      JSON.stringify({
+        escrow_lines: [
+          { exchange_id: "90", sku: "A", amount_minor: 500, status: "committed" },
+          { exchange_id: "91", sku: "B", amount_minor: 700 },
+        ],
+      }),
+    );
+    assertEquals(discoverReversals("ord-D", []), []);
+    // No archive for the order at all: empty, non-throwing.
+    assertEquals(discoverReversals("missing", []), []);
+  });
 });
 
 Deno.test("buildRevisePlan: two-step cancel-and-rebuy, moves no money, embeds the kept cart", () => {

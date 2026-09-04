@@ -148,7 +148,7 @@ The `facet_*` tools above are served by an MCP (Model Context Protocol) server o
 Point your MCP client at this stdio command:
 
 ```bash
-deno run --allow-env --allow-read --allow-run --allow-net "$SKILL/scripts/mcp-server.ts"
+deno run --allow-env --allow-read --allow-write="$HOME/.cache,$HOME/.facet" --allow-run --allow-net "$SKILL/scripts/mcp-server.ts"
 ```
 
 or, from the skill directory, `deno task mcp`. A typical MCP client config entry:
@@ -158,7 +158,7 @@ or, from the skill directory, `deno task mcp`. A typical MCP client config entry
   "mcpServers": {
     "facet-shopping": {
       "command": "deno",
-      "args": ["run", "--allow-env", "--allow-read", "--allow-run", "--allow-net", "<absolute path>/scripts/mcp-server.ts"]
+      "args": ["run", "--allow-env", "--allow-read", "--allow-write=$HOME/.cache,$HOME/.facet", "--allow-run", "--allow-net", "<absolute path>/scripts/mcp-server.ts"]
     }
   }
 }

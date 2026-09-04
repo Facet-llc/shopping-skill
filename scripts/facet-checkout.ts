@@ -4839,7 +4839,10 @@ function saveLifecycleReceipt(
 // fold into their result under `receipt`. Best-effort by construction: the reversal
 // already happened on-chain, so a receipt problem must never read as a failed
 // reversal. Returns { available:false, note } when the event has not anchored yet.
-async function fetchVerifySaveLifecycle(
+// Exported so the in-process per-line SET cancel (mcp-server.ts) can archive each
+// cancelled line's signed cancel receipt through the SAME fetch + verify + save path
+// the single-action cancel uses, keying the archive on `lifecycle-cancel-<exchangeId>`.
+export async function fetchVerifySaveLifecycle(
   base: string,
   lookup: LifecycleLookup,
   kya: string,
@@ -5012,29 +5015,38 @@ function readArchivedLifecycles(
   return out;
 }
 
-/** Discover post-settlement reversals for an order: read the live per-line escrow
- *  state (the same owner-scoped checkout-session read facet_lines uses), take every
- *  line now Revoked/Canceled, price it from the line's escrow amount (atomic USDC ->
- *  minor units), resolve its SKU/name, and attach the archived signed lifecycle
- *  receipt (tx + verified) as proof. Best-effort and non-throwing: returns [] when
- *  the session is unreachable or no line is reversed, so the receipt still renders. */
-function discoverReversals(
+/** Discover post-settlement reversals for an order from the local settlement
+ *  archive (no live call): read the order's archived escrow lines (exchange_id +
+ *  sku + name + amount_minor per line, written by `buy --settle`), and take every
+ *  line that was reversed. A line counts as reversed when EITHER it has an archived
+ *  signed lifecycle receipt (a cancel / withdraw / refund) OR its archived escrow-line
+ *  `status` is "cancelled" (set by a per-line SET cancel whose signed receipt may not
+ *  have anchored yet, or on a repaired historical order). Price it from the line's
+ *  escrow amount, resolve its SKU/name, and fold in the recorded signatures when a
+ *  signed receipt exists (a status-only line emits a signature-less reversal, still
+ *  counted toward Net-now). Best-effort and non-throwing: returns [] when there is no
+ *  archive or no line is reversed, so the receipt still renders. Exported for tests. */
+export function discoverReversals(
   orderId: string,
   items: ReadonlyArray<{ name: string; sku: string; qty: number; amount_minor?: number }>,
 ): ReversalEntry[] {
   // Archive-driven (no live call): a settled order's checkout session is gone (404),
   // so read the order's escrow lines from the settlement archive (exchange_id + sku +
-  // name + amount_minor per line, written by `buy --settle`), and for each line that
-  // has a signed lifecycle receipt in the archive, build a reversal carrying that line's
-  // amount + the recorded signatures.
-  let escrowLines: Array<
-    { exchange_id?: string; sku?: string; name?: string; amount_minor?: number }
-  > = [];
+  // name + amount_minor + status per line, written by `buy --settle` and, for status,
+  // updated by a per-line SET cancel), and for each line that has a signed lifecycle
+  // receipt in the archive OR a "cancelled" status, build a reversal carrying that
+  // line's amount + the recorded signatures.
+  type ArchivedEscrowLine = {
+    exchange_id?: string;
+    sku?: string;
+    name?: string;
+    amount_minor?: number;
+    status?: string;
+  };
+  let escrowLines: ArchivedEscrowLine[] = [];
   try {
     const archived = JSON.parse(Deno.readTextFileSync(`${receiptsDir()}/${orderId}.json`)) as {
-      escrow_lines?: Array<
-        { exchange_id?: string; sku?: string; name?: string; amount_minor?: number }
-      >;
+      escrow_lines?: ArchivedEscrowLine[];
     };
     if (Array.isArray(archived.escrow_lines)) escrowLines = archived.escrow_lines;
   } catch {
@@ -5045,7 +5057,13 @@ function discoverReversals(
     const exchangeId = String(line.exchange_id ?? "");
     if (exchangeId === "") continue;
     const signatures = readArchivedLifecycles(exchangeId);
-    if (signatures.length === 0) continue; // this line was not reversed
+    // A line counts as reversed when it has an archived signed lifecycle receipt OR
+    // its archived escrow-line status is "cancelled" (a per-line SET cancel marks the
+    // status even when the signed receipt has not anchored yet, and a historical order
+    // can be repaired the same way). A signed receipt is the stronger proof, so keep
+    // folding its signatures in; a status-only line emits a signature-less reversal.
+    const cancelledByStatus = line.status === "cancelled";
+    if (signatures.length === 0 && !cancelledByStatus) continue; // this line was not reversed
     // A merchant refund receipt makes it a refund; a seller revoke or buyer cancel is a cancel.
     const kind: ReversalEntry["kind"] = signatures.some((s) => s.kind === "refund")
       ? "refund"

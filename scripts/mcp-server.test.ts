@@ -12,9 +12,11 @@ import { assert, assertEquals, assertStringIncludes } from "jsr:@std/assert@^1";
 import {
   armPerLineDeferred,
   type BuyArmTarget,
+  cancelledExchangeIdsFromResponse,
   classifyBuyArm,
   executeTool,
   handleMessage,
+  markCancelledLinesInArchive,
   normalizeExchangeIds,
   perLineBodyKey,
   planPerLineEscrowAction,
@@ -1048,5 +1050,111 @@ Deno.test("readArchivedLines: returns the settle-time escrow_lines, null when ab
     if (prev === undefined) Deno.env.delete("FACET_RECEIPTS_DIR");
     else Deno.env.set("FACET_RECEIPTS_DIR", prev);
     Deno.removeSync(dir, { recursive: true });
+  }
+});
+
+// cancelledExchangeIdsFromResponse: which lines a per-line SET cancel actually
+// cancelled. Defensive: only an EXPLICIT failure marker drops a line, so an unknown
+// or detail-less response keeps every requested id (the top-level response reported
+// ok). This is what the cancel path feeds into the two best-effort archive writes.
+Deno.test("cancelledExchangeIdsFromResponse: keeps all requested when there is no per-line detail", () => {
+  assertEquals(cancelledExchangeIdsFromResponse(null, ["1", "2"]), ["1", "2"]);
+  assertEquals(cancelledExchangeIdsFromResponse({ ok: true }, ["1", "2"]), ["1", "2"]);
+  assertEquals(
+    cancelledExchangeIdsFromResponse(
+      { lines: [{ exchange_id: "1" }, { exchange_id: "2" }] },
+      ["1", "2"],
+    ),
+    ["1", "2"],
+  );
+});
+
+Deno.test("cancelledExchangeIdsFromResponse: drops only lines with an explicit failure marker", () => {
+  const body = {
+    lines: [
+      { exchange_id: "1", status: "cancelled" },
+      { exchange_id: "2", status: "failed" },
+      { exchange_id: "3", ok: false },
+      { exchange_id: "4", state: "error" },
+      { exchange_id: "5", status: "rejected" },
+      { exchange_id: "6" },
+    ],
+  };
+  assertEquals(
+    cancelledExchangeIdsFromResponse(body, ["1", "2", "3", "4", "5", "6"]),
+    ["1", "6"],
+  );
+  // Only requested ids are returned, even when the response lists extras.
+  assertEquals(cancelledExchangeIdsFromResponse(body, ["1"]), ["1"]);
+});
+
+// markCancelledLinesInArchive: the PART 2 write. It scans the receipts dir for the
+// settlement archive whose escrow_lines carry a cancelled exchange id and sets
+// status:"cancelled" on each matching line, leaving other lines, other fields, the
+// lifecycle receipt files, and non-order json untouched. Best-effort, never throws.
+Deno.test("markCancelledLinesInArchive: sets status on matching lines, preserves the rest", () => {
+  const dir = Deno.makeTempDirSync();
+  const prev = Deno.env.get("FACET_RECEIPTS_DIR");
+  Deno.env.set("FACET_RECEIPTS_DIR", dir);
+  try {
+    const order = {
+      order_id: "ord-1",
+      items: [{ sku: "HCF-BDAY", qty: 1 }],
+      escrow_lines: [
+        { exchange_id: "50", sku: "HCF-BDAY", amount_minor: 1624 },
+        { exchange_id: "51", sku: "HCF-CARD", amount_minor: 900 },
+        { exchange_id: "52", sku: "HCF-VASE", amount_minor: 500 },
+      ],
+    };
+    Deno.writeTextFileSync(`${dir}/ord-1.json`, JSON.stringify(order, null, 2));
+    // A lifecycle receipt file and a non-order json must be left untouched.
+    Deno.writeTextFileSync(
+      `${dir}/lifecycle-cancel-50.json`,
+      JSON.stringify({ kind: "cancel", jws: "x" }),
+    );
+    Deno.writeTextFileSync(`${dir}/index.jsonl`, "");
+
+    const marked = markCancelledLinesInArchive(["50", "51"]);
+    assertEquals(marked.sort(), ["50", "51"]);
+
+    const after = JSON.parse(Deno.readTextFileSync(`${dir}/ord-1.json`)) as {
+      order_id: string;
+      items: Array<{ sku: string; qty: number }>;
+      escrow_lines: Array<Record<string, unknown>>;
+    };
+    // Matching lines flipped to cancelled; the third line and all other fields intact.
+    assertEquals(after.escrow_lines[0]!.status, "cancelled");
+    assertEquals(after.escrow_lines[1]!.status, "cancelled");
+    assertEquals(after.escrow_lines[2]!.status, undefined);
+    assertEquals(after.escrow_lines[0]!.amount_minor, 1624);
+    assertEquals(after.escrow_lines[2]!.exchange_id, "52");
+    assertEquals(after.order_id, "ord-1");
+    assertEquals(after.items, [{ sku: "HCF-BDAY", qty: 1 }]);
+
+    // The lifecycle receipt file is untouched (no status leaks into it).
+    const lc = JSON.parse(Deno.readTextFileSync(`${dir}/lifecycle-cancel-50.json`));
+    assertEquals(lc, { kind: "cancel", jws: "x" });
+
+    // Idempotent: a second run marks nothing new and never throws.
+    assertEquals(markCancelledLinesInArchive(["50", "51"]), []);
+    // Empty input is a no-op.
+    assertEquals(markCancelledLinesInArchive([]), []);
+  } finally {
+    if (prev === undefined) Deno.env.delete("FACET_RECEIPTS_DIR");
+    else Deno.env.set("FACET_RECEIPTS_DIR", prev);
+    Deno.removeSync(dir, { recursive: true });
+  }
+});
+
+Deno.test("markCancelledLinesInArchive: a missing receipts dir yields no marks, never throws", () => {
+  const prev = Deno.env.get("FACET_RECEIPTS_DIR");
+  const parent = Deno.makeTempDirSync();
+  Deno.env.set("FACET_RECEIPTS_DIR", `${parent}/does-not-exist`);
+  try {
+    assertEquals(markCancelledLinesInArchive(["1"]), []);
+  } finally {
+    if (prev === undefined) Deno.env.delete("FACET_RECEIPTS_DIR");
+    else Deno.env.set("FACET_RECEIPTS_DIR", prev);
+    Deno.removeSync(parent, { recursive: true });
   }
 });

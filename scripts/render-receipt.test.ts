@@ -132,6 +132,53 @@ Deno.test("fillReceiptTemplate omits Net-now when a reversal has no amount", () 
   assert(!html.includes("Net now"), "Net-now needs every reversal to carry an amount");
 });
 
+Deno.test("fillReceiptTemplate renders a signature-less reversal (row + amount, no signature block)", () => {
+  const html = fillReceiptTemplate(TEMPLATE, {
+    jws: makeJws(CLAIMS),
+    pubkeyX: "k",
+    merchant: { name: "Pecan & Petal", host: "pecanandpetal.facet.llc" },
+    // A status-only cancel from the archive: no signed lifecycle receipt anchored yet,
+    // so signatures is empty. The row and its amount must render and never a sig block.
+    reversals: [
+      {
+        kind: "cancel",
+        exchange_id: "70",
+        name: "Birthday Arrangement",
+        amount_minor: 1500,
+        signatures: [],
+      },
+    ],
+  });
+  assert(!html.includes("%%"), "every token must be consumed");
+  assertStringIncludes(html, "Amendments");
+  assertStringIncludes(html, "Birthday Arrangement cancelled");
+  assertStringIncludes(html, "-$15.00");
+  assert(!html.includes("rev-sig"), "a signature-less reversal renders no signature block");
+});
+
+Deno.test("fillReceiptTemplate renders a FULL signature-less cancel with Net now = 0", () => {
+  const html = fillReceiptTemplate(TEMPLATE, {
+    jws: makeJws(CLAIMS), // settlement amount_minor 2524
+    pubkeyX: "k",
+    merchant: { name: "Pecan & Petal", host: "pecanandpetal.facet.llc" },
+    // Three lines, all cancelled by archived status, none with a signed receipt yet.
+    reversals: [
+      { kind: "cancel", exchange_id: "1", name: "Goods", amount_minor: 1500, signatures: [] },
+      { kind: "cancel", exchange_id: "2", name: "Tax", amount_minor: 124, signatures: [] },
+      { kind: "cancel", exchange_id: "3", name: "Shipping", amount_minor: 900, signatures: [] },
+    ],
+  });
+  assert(!html.includes("%%"), "every token must be consumed");
+  assertStringIncludes(html, "Amendments");
+  assertStringIncludes(html, "Goods cancelled");
+  assertStringIncludes(html, "Tax cancelled");
+  assertStringIncludes(html, "Shipping cancelled");
+  // 2524 total minus (1500 + 124 + 900 = 2524) => Net now $0.00.
+  assertStringIncludes(html, "Net now");
+  assertStringIncludes(html, "$0.00");
+  assert(!html.includes("rev-sig"), "no signature block for status-only cancels");
+});
+
 Deno.test("fillReceiptTemplate renders a fallback when there are no items", () => {
   const html = fillReceiptTemplate(TEMPLATE, { jws: makeJws(CLAIMS), pubkeyX: "k", merchant: { name: "m", host: "h" } });
   assertStringIncludes(html, "Line items are not available");

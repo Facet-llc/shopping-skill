@@ -2,7 +2,7 @@
   "tasks": {
     "test": "deno test --allow-env --allow-read --allow-write --allow-run --allow-net scripts/",
     "check": "deno check scripts/facet-checkout.ts scripts/kya-provision.ts scripts/browse-storefront.ts scripts/wallet.ts scripts/mcp-server.ts scripts/order-prefs.ts scripts/render-receipt.ts scripts/version.ts",
-    "mcp": "deno run --allow-env --allow-read --allow-run --allow-net scripts/mcp-server.ts",
+    "mcp": "deno run --allow-env --allow-read --allow-write=$HOME/.cache,$HOME/.facet --allow-run --allow-net scripts/mcp-server.ts",
     "lint": "deno lint scripts/",
     "fmt": "deno fmt scripts/",
     "fmt:check": "deno fmt --check scripts/"
