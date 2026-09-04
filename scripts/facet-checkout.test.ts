@@ -45,6 +45,9 @@ import {
   buildRevisePlan,
   buildWithdrawTypedData,
   BOSON_BUYER_PROTECTION,
+  buildCardReservationResult,
+  CARD_BUYER_PROTECTION,
+  mppStripeGate,
   X402_BUYER_PROTECTION,
   chooseRail,
   type CurrentProduct,
@@ -1804,4 +1807,142 @@ Deno.test("refundReversalFromReceipt: omits amount_minor when the event has none
   // No JWS to embed -> nothing to render, so no Amendment.
   assertEquals(refundReversalFromReceipt({}, "o", true), null);
   assertEquals(refundReversalFromReceipt({ jws: "" }, "o", true), null);
+});
+
+// ---- card rail: CARD_BUYER_PROTECTION + buildCardReservationResult -------------------
+// The card ("rail: card") reservation hold. A card buyer settles off the on-chain rails
+// entirely (Stripe Link via link-cli), so the DRY hold returns the priced reservation
+// with NO on-chain rail selected, no signed USDC transfer, and no USDC-balance gate: the
+// wallet is only the buyer's identity on this rail. Offline: a pure builder, no wallet,
+// secret, or network. Extracted from cmdBuy so exactly these invariants are pinned.
+
+// A minimal UCP totals breakdown with a `total` entry (minor units + currency), the shape
+// ucpTotalMinor and the card builder read.
+function cardTotals(amountMinor: number, currency = "usd") {
+  return [
+    { type: "subtotal", amount: String(amountMinor) },
+    { type: "total", amount: String(amountMinor), currency },
+  ];
+}
+
+Deno.test("card buyer_protection is rail-accurate: a card charge is NEVER sold as escrow", () => {
+  // The card rail settles to the merchant's own Stripe account, not into escrow, so its
+  // buyer_protection must say so, mirroring the x402 / boson consts above.
+  assertEquals(CARD_BUYER_PROTECTION.escrow, false);
+  assertEquals(CARD_BUYER_PROTECTION.rail, "card/stripe");
+  assert(/not held in escrow/i.test(CARD_BUYER_PROTECTION.summary), "summary must say NOT escrow");
+  assert(/refund/i.test(CARD_BUYER_PROTECTION.recourse), "recourse must mention a refund");
+  assert(/terminal/i.test(CARD_BUYER_PROTECTION.recourse), "recourse must point to the Terminal");
+});
+
+Deno.test("card reservation: holds the priced reservation with no on-chain rail and no USDC gate", () => {
+  const r = buildCardReservationResult({
+    base: "https://pecanandpetal.facet.llc",
+    checkoutId: "chk_card_1",
+    totals: cardTotals(4200, "usd"),
+    totalMinor: 4200,
+    buyer: "0x00000000000000000000000000000000000000A1",
+    items: [{ id: "HCF-BDAY", qty: 1 }, { id: "HCF-CARD", qty: 2 }],
+    shippingEmailSignal: "opted_in",
+  });
+  // A DRY hold, not a settlement: the reservation is held, nothing has moved.
+  assertEquals(r.ok, true);
+  assertEquals(r.mode, "DRY");
+  assertEquals(r.dry, true);
+  assertEquals(r.settled, false);
+  // The card rail, and the reservation id echoed as both checkout_id and reservation_id.
+  assertEquals(r.rail, "card/stripe");
+  assertEquals(r.checkout_id, "chk_card_1");
+  assertEquals(r.reservation_id, "chk_card_1");
+  // The server-derived total, in minor units and as a display number, plus the currency.
+  assertEquals(r.total_minor, 4200);
+  assertEquals(r.total, 42);
+  assertEquals(r.currency, "USD");
+  // Rail-accurate protection (the exported const), never escrow.
+  assertEquals(r.buyer_protection, CARD_BUYER_PROTECTION);
+  assertEquals((r.buyer_protection as { escrow: boolean }).escrow, false);
+  // The KEY invariant: the hold selects NO on-chain rail, pre-signs NOTHING, and never
+  // gates on a USDC balance, so the result must carry none of the on-chain settlement
+  // fields the USDC / Boson paths emit.
+  const onchainFields = [
+    "signature",
+    "token_authorization",
+    "authorization",
+    "payment",
+    "confirm_atomic",
+    "price_usdc",
+  ];
+  for (const f of onchainFields) {
+    assertEquals(f in r, false);
+  }
+  // The next step is the card flow (link-cli), never a facet_buy settle.
+  assertStringIncludes(String(r.next), "link-cli mpp pay");
+});
+
+Deno.test("card reservation: attaches order_attributes only when present, omits currency when absent", () => {
+  // With order attributes and a currency: both ride on the hold.
+  const withAttrs = buildCardReservationResult({
+    base: "https://m.facet.llc",
+    checkoutId: "chk_2",
+    totals: cardTotals(1000, "eur"),
+    totalMinor: 1000,
+    buyer: "0x00000000000000000000000000000000000000A2",
+    items: [{ id: "X", qty: 1 }],
+    orderAttributes: { gift_message: "Happy birthday" },
+    shippingEmailSignal: "unset",
+  });
+  assertEquals(withAttrs.order_attributes, { gift_message: "Happy birthday" });
+  assertEquals(withAttrs.currency, "EUR");
+  // No attributes and no currency in the totals: neither key is present (absent, not an
+  // empty object or an undefined value), so the hold body stays minimal.
+  const bare = buildCardReservationResult({
+    base: "https://m.facet.llc",
+    checkoutId: "chk_3",
+    totals: [{ type: "total", amount: "1000" }],
+    totalMinor: 1000,
+    buyer: "0x00000000000000000000000000000000000000A3",
+    items: [{ id: "X", qty: 1 }],
+    shippingEmailSignal: "unset",
+  });
+  assertEquals("order_attributes" in bare, false);
+  assertEquals("currency" in bare, false);
+});
+
+// ---- mppStripeGate: the MPP stripe/charge fail-closed guard --------------------------
+// cmdMppCharge draws the challenge, then classifies the method + Stripe sandbox key. The
+// invariant: a card (stripe) charge with no `sk_test_` key FAILS CLOSED (refuse, nothing
+// charged); only a test key proceeds (mint a TEST SPT); a non-stripe method falls through
+// to the evm/charge escrow guard. Offline: a pure classifier.
+
+Deno.test("CRITICAL: mppStripeGate fails closed on stripe with no sk_test_ key (never charges)", () => {
+  // No key at all: refuse, naming the env var the caller needs. This is the guard that
+  // stops a card charge the skill cannot legitimately mint.
+  assertEquals(mppStripeGate("stripe", ""), { kind: "refuse", needs: "FACET_STRIPE_SANDBOX_SK" });
+  // A LIVE key is not a sandbox key: still refuse (this skill mints TEST SPTs only).
+  const live = mppStripeGate("stripe", "sk_live_abc123");
+  assertEquals(live, { kind: "refuse", needs: "FACET_STRIPE_SANDBOX_SK" });
+  // A junk / non-key value is refused too.
+  assertEquals(mppStripeGate("stripe", "not-a-key").kind, "refuse");
+});
+
+Deno.test("mppStripeGate: a stripe method with a sk_test_ key proceeds (case-insensitive)", () => {
+  assertEquals(mppStripeGate("stripe", "sk_test_abc123"), { kind: "proceed" });
+  // The method match is case-insensitive, as the live code lowercases it.
+  assertEquals(mppStripeGate("STRIPE", "sk_test_abc123"), { kind: "proceed" });
+});
+
+Deno.test("mppStripeGate: a non-stripe method falls through to the evm/charge escrow guard", () => {
+  // "not_stripe" is the signal cmdMppCharge uses to skip the card branch and run the evm
+  // escrow guard, and it must not depend on the key at all.
+  assertEquals(mppStripeGate("evm", ""), { kind: "not_stripe" });
+  assertEquals(mppStripeGate("evm", "sk_test_abc123"), { kind: "not_stripe" });
+});
+
+Deno.test("evm/charge still reaches the escrow guard: a Boson merchant over MPP evm is refused", () => {
+  // Item 3, made explicit against the refactor: for a non-stripe (evm) method the gate
+  // returns not_stripe, so control reaches the escrow guard, and that guard refuses an MPP
+  // charge at a Boson-escrow merchant (mppRefusedForEscrow is true). Together these pin
+  // that relocating the guard did NOT open an escrow-bypass on the evm path.
+  assertEquals(mppStripeGate("evm", "").kind, "not_stripe");
+  assertEquals(mppRefusedForEscrow({ [BOSON_HANDLER]: [{}], [X402_HANDLER]: [{}] }), true);
 });

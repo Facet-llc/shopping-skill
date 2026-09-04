@@ -233,6 +233,68 @@ export const BOSON_BUYER_PROTECTION = {
     "`withdraw`); after redeem, `dispute` or `refund`. Funds stay in escrow until you " +
     "confirm receipt or the window elapses.",
 } as const;
+
+// The card rail settles to the merchant's OWN connected Stripe account (via Stripe Link /
+// link-cli), not on-chain and not into escrow, so its recourse is a card refund request,
+// not an escrow release. Exported (like the two above) so a test can pin escrow === false.
+export const CARD_BUYER_PROTECTION = {
+  rail: "card/stripe",
+  escrow: false,
+  summary:
+    "This card charge settles to the merchant's own connected Stripe account. It is " +
+    "NOT held in escrow; the charge is the merchant's on capture.",
+  recourse:
+    "If something is wrong, open a refund request through the Terminal against your " +
+    'receipt (`refund --order-id <id> --reason "..."`); the merchant reviews and approves.',
+} as const;
+
+// Build the DRY result for a card ("rail: card") reservation hold: the priced reservation's
+// id plus the server-derived total, with NO on-chain rail selected, no signed USDC transfer,
+// and no USDC-balance gate (the wallet is only identity on the card rail). Extracted from
+// cmdBuy and exported so the hold shape is unit-tested. `totalMinor` is the already-read UCP
+// total; the caller `die`s on a missing total before calling this.
+export function buildCardReservationResult(a: {
+  base: string;
+  checkoutId: string;
+  totals: unknown;
+  totalMinor: number;
+  buyer: string;
+  items: readonly unknown[];
+  orderAttributes?: Record<string, string>;
+  shippingEmailSignal: unknown;
+}): Record<string, unknown> {
+  const totalEntry = Array.isArray(a.totals)
+    ? (a.totals as Array<Record<string, unknown>>).find(
+      (t) => t !== null && typeof t === "object" && t.type === "total",
+    )
+    : undefined;
+  const currencyRaw = totalEntry?.currency;
+  const currency = typeof currencyRaw === "string" ? currencyRaw.toUpperCase() : undefined;
+  return {
+    ok: true,
+    mode: "DRY",
+    dry: true,
+    settled: false,
+    rail: "card/stripe",
+    checkout_id: a.checkoutId,
+    reservation_id: a.checkoutId,
+    total_minor: a.totalMinor,
+    total: a.totalMinor / 100,
+    ...(currency !== undefined ? { currency } : {}),
+    buyer: a.buyer,
+    items: a.items,
+    ...(a.orderAttributes !== undefined ? { order_attributes: a.orderAttributes } : {}),
+    shipping_email_pref: a.shippingEmailSignal,
+    buyer_protection: CARD_BUYER_PROTECTION,
+    next: `pay by card: link-cli mpp pay ${a.base}/mpp/v1/charges --method POST --data ` +
+      `'{"reservation_id":"${a.checkoutId}"}' --context "<what the user is buying and why, 100+ chars>"`,
+    message: `Reservation held for card: ${(a.totalMinor / 100).toFixed(2)}${
+      currency !== undefined ? " " + currency : ""
+    } for ${a.items.length} item(s). No USDC is spent on the card rail (the wallet is only ` +
+      `the identity). Confirm the total with the user, then pay by card with link-cli mpp ` +
+      `pay against reservation ${a.checkoutId}.`,
+  };
+}
 // The JWS `typ` the Facet ledger stamps on a settlement receipt. Part of the
 // wire contract: the verifier routes on it and refuses anything else.
 const FACET_RECEIPT_TYP = "facet-receipt+jws";
@@ -1078,6 +1140,19 @@ export function mppRefusedForEscrow(paymentHandlers: Record<string, unknown> | u
   return Object.prototype.hasOwnProperty.call(handlers, BOSON_HANDLER);
 }
 
+// Pure classification of an MPP charge's drawn method against the presence of a Stripe
+// sandbox key, extracted from cmdMppCharge so the FAIL-CLOSED decision is unit-tested.
+// "not_stripe" falls through to the evm/charge escrow guard; "refuse" fails closed (no
+// sk_test_ key to mint a TEST SPT, so nothing is charged); "proceed" mints a TEST SPT.
+export function mppStripeGate(
+  method: string,
+  sk: string,
+): { kind: "not_stripe" } | { kind: "refuse"; needs: string } | { kind: "proceed" } {
+  if (method.toLowerCase() !== "stripe") return { kind: "not_stripe" };
+  if (!sk.startsWith("sk_test_")) return { kind: "refuse", needs: "FACET_STRIPE_SANDBOX_SK" };
+  return { kind: "proceed" };
+}
+
 // Decode a KYA's identity claims (aid, issuer, expiry) from the token's JWT
 // payload, for the provenance record. The KYA is a bearer credential, so this
 // NEVER returns the raw token: it splits the JWT and reads only the middle
@@ -1570,14 +1645,15 @@ async function cmdMppCharge(flags: Record<string, string | boolean>): Promise<ne
   // amount and terms are server-derived from the reservation; the card credential is
   // an SPT, not this wallet's ERC-3009 authorization, so the buyer wallet never signs
   // here. Without the key, refuse with a clear message (no key to mint an SPT).
-  if (String(challenge.method).toLowerCase() === "stripe") {
-    const sk = Deno.env.get("FACET_STRIPE_SANDBOX_SK") ?? "";
-    if (!sk.startsWith("sk_test_")) {
+  const sk = Deno.env.get("FACET_STRIPE_SANDBOX_SK") ?? "";
+  const stripeGate = mppStripeGate(String(challenge.method), sk);
+  if (stripeGate.kind !== "not_stripe") {
+    if (stripeGate.kind === "refuse") {
       die(
         `this merchant settles via Stripe (method=${challenge.method}/${challenge.intent}). ` +
           `Completing it needs a Stripe Shared Payment Token; this skill mints a TEST SPT only when ` +
           `FACET_STRIPE_SANDBOX_SK (an sk_test_ key) is set. Set it to demo the card path, or use \`buy\`.`,
-        { method: String(challenge.method), intent: String(challenge.intent), needs: "FACET_STRIPE_SANDBOX_SK" },
+        { method: String(challenge.method), intent: String(challenge.intent), needs: stripeGate.needs },
       );
     }
     const sreq = (challenge.request ?? {}) as { amount?: string; currency?: string };
@@ -2113,46 +2189,16 @@ async function cmdBuy(flags: Record<string, string | boolean>): Promise<never> {
     if (totalMinor === null) {
       die("could not read the reservation total from the checkout session (no UCP `total` entry).");
     }
-    const totalEntry = Array.isArray(session.totals)
-      ? (session.totals as Array<Record<string, unknown>>).find(
-        (t) => t !== null && typeof t === "object" && t.type === "total",
-      )
-      : undefined;
-    const currencyRaw = totalEntry?.currency;
-    const currency = typeof currencyRaw === "string" ? currencyRaw.toUpperCase() : undefined;
-    emit({
-      ok: true,
-      mode: "DRY",
-      dry: true,
-      settled: false,
-      rail: "card/stripe",
-      checkout_id: session.id,
-      reservation_id: session.id,
-      total_minor: totalMinor,
-      total: totalMinor / 100,
-      ...(currency !== undefined ? { currency } : {}),
+    emit(buildCardReservationResult({
+      base,
+      checkoutId: session.id,
+      totals: session.totals,
+      totalMinor,
       buyer: account.address,
       items,
-      ...(hasOrderAttributes ? { order_attributes: orderAttributes } : {}),
-      shipping_email_pref: shippingEmailSignal,
-      buyer_protection: {
-        rail: "card/stripe",
-        escrow: false,
-        summary:
-          "This card charge settles to the merchant's own connected Stripe account. It is " +
-          "NOT held in escrow; the charge is the merchant's on capture.",
-        recourse:
-          "If something is wrong, open a refund request through the Terminal against your " +
-          'receipt (`refund --order-id <id> --reason "..."`); the merchant reviews and approves.',
-      },
-      next: `pay by card: link-cli mpp pay ${base}/mpp/v1/charges --method POST --data ` +
-        `'{"reservation_id":"${session.id}"}' --context "<what the user is buying and why, 100+ chars>"`,
-      message: `Reservation held for card: ${(totalMinor / 100).toFixed(2)}${
-        currency !== undefined ? " " + currency : ""
-      } for ${items.length} item(s). No USDC is spent on the card rail (the wallet is only ` +
-        `the identity). Confirm the total with the user, then pay by card with link-cli mpp ` +
-        `pay against reservation ${session.id}.`,
-    });
+      orderAttributes: hasOrderAttributes ? orderAttributes : undefined,
+      shippingEmailSignal,
+    }));
   }
 
   const handlers = session.payment_handlers ?? {};
