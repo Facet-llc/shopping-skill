@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "facet-storefront"
+version = "0.1.0"
+description = "A Facet storefront backend for Anthropic's commerce-agents Shopping Agent: shop a Facet merchant's catalog and check out non-custodially through a Facet UCP checkout session."
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+readme = "README.md"
+authors = [{ name = "Facet, LLC" }]
+classifiers = ["License :: OSI Approved :: Apache Software License"]
+
+# shopping-agent-core (the StorefrontBackend interface and the domain types) is
+# installed from the commerce-agents repo, not a public index. Install it and its
+# sibling commerce-common first (commerce-agents/scripts/install.sh), then install
+# this adapter into the same environment.
+dependencies = [
+  "shopping-agent-core>=0.1.0.dev0",
+  "httpx>=0.27",
+  "pydantic>=2.7",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.23"]
+# The front-half MCP server (facet_storefront.server): commerce-agents' storefront
+# tools over the Facet backend. mcp is pinned to v1 (commerce-agents targets the
+# mcp.server.fastmcp module, renamed in mcp 2.x).
+server = ["commerce-common[mcp]>=0.1.0.dev0", "mcp>=1.2,<2"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["facet_storefront"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

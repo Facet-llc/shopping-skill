@@ -222,7 +222,7 @@ This skill runs in six phases, the decomposition a good shopping agent follows. 
 - **Plan**: turn the intent into a concrete order. Quantities, any gift message or delivery date, which items make the cut.
 - **Cart**: hold the selection. There is no store cart; you are the cart (see "The conversational cart").
 - **Checkout**: the signed Facet rail only. Discover the rails, pick the wallet and payment method, provision the KYA, DRY quote, confirm, settle. Steps 4 to 8.
-- **Memory**: carry what you learn about the buyer. Their shipping-confirmation choice persists across orders (asked once, via `facet_email_pref`); their light preferences and favorite merchants ("no lilies", "under $30") you hold within the conversation. Read it at search and quote time so the order is faster and more personal.
+- **Memory**: carry what you learn about the buyer across orders. Their shipping-confirmation choice (asked once, via `facet_email_pref`), and their light preferences and favorite merchants (`save_memory` / `recall_memories` in the structured front half, see "The structured front half"). Read it at search and quote time so the next order is faster and more personal.
 
 The numbered flow below is these six phases in order.
 
@@ -248,6 +248,30 @@ Steps 1 and 2 are an active job in your native browser, driven live in front of 
 - Fallbacks, and only when you genuinely cannot drive a browser: the Terminal's own catalog via `facet_search` (after identity is set) or `facet_browse_storefront` for a lean public list. These are backups for a headless environment, never the default, and neither one replaces showing the user.
 
 This whole loop is browsing, not buying. Never proceed into the store's cart or checkout, and never touch a pay button on the merchant's page. The moment the user picks, switch to the Facet Terminal (steps 4 to 8); checkout is always the signed rail, never the store's own checkout.
+
+## The structured front half (the commerce-agents engine)
+
+The browser walkthrough above is the human-facing show: it lets the user watch their own shopping happen. Underneath it, the shopping ENGINE, search, compare, cart, and customer memory, is Anthropic's `commerce-agents` storefront running over Facet. Facet keeps the whole back half: the KYA identity on every read, the UCP checkout, and the settlement rails. The engine lives in `integrations/commerce-agents/facet-storefront` (a `StorefrontBackend` adapter plus a storefront MCP server).
+
+Run it and connect to it as an MCP server:
+
+```
+pip install -e 'integrations/commerce-agents/facet-storefront[server]'
+FACET_KYA="<the buyer's KYA>" \
+FACET_STOREFRONT_TERMINAL="https://<merchant>.facet.llc" \
+FACET_PLATFORM_TERMINAL="https://api.facet.llc" \
+python -m facet_storefront.server        # 127.0.0.1:8200/mcp
+```
+
+It exposes the front-half tools, each returning `<storefront_data>`-fenced facts and gated by a per-session provenance record: `search_products`, `get_product_details`, `get_cart`, `add_to_cart`, `update_cart_item`, `remove_from_cart`, `get_preferences`, `save_memory`, `recall_memories`, `get_orders`, `get_order_status`, `search_policies`, `get_fulfillment_options`. Every read carries the buyer's Facet KYA.
+
+How the two halves compose:
+- The engine is the shopping truth: the catalog reads, the cart, and the customer memory all live there. Use its `search_products` and `get_product_details` for the catalog, and hold the cart with `add_to_cart` / `update_cart_item` / `remove_from_cart` instead of only your own working memory.
+- The visible browser is the presentation on top: drive it as before so the user watches their shopping happen, and render the engine's results as the table with check marks.
+- Memory is persistent and personal: `recall_memories` at search and quote time to personalize (favorite merchants, stated preferences, "no lilies"), and `save_memory` when the buyer tells you something worth keeping. This is the customer memory beyond the one-shot shipping-email preference, and it persists across sessions in `~/.cache/facet/storefront-memory.json`.
+- Checkout stays Facet, unchanged: take the engine's cart items and run the Facet checkout (`facet_buy` DRY, then confirm, then settle), so identity, the UCP checkout, and the rails are exactly as documented below. The engine's own checkout card hands off the same Facet UCP checkout-session URL for a non-skill host; in this skill, the proven `facet_buy` path is the settle.
+
+The engine never signs a payment or holds a wallet key; it reads the catalog and stages the cart, and Facet settles. When you cannot run the Python engine (a constrained environment), fall back to the browser walkthrough plus the `facet_*` catalog tools; the engine is the upgrade to the front half, not a hard dependency of it.
 
 ## Choosing the wallet (at the handoff)
 
