@@ -598,6 +598,7 @@ function buildBuyArgv(a: Args): string[] {
   pushStr(v, "delivery-date", a.delivery_date);
   pushStr(v, "occasion", a.occasion);
   pushStr(v, "rail", a.rail);
+  pushStr(v, "payment-method", a.payment_method);
   return v;
 }
 
@@ -988,7 +989,11 @@ export const TOOLS: ToolDef[] = [
       "\"card\": the dry run holds the reservation and returns checkout_id plus the total " +
       "WITHOUT gating on the wallet's USDC balance, because the card settles through Stripe " +
       "Link via link-cli and spends no USDC (the wallet is only the identity). Then pay with " +
-      "link-cli mpp pay against that reservation_id; do not settle facet_buy on the card rail.",
+      "link-cli mpp pay against that reservation_id; do not settle facet_buy on the card rail. " +
+      "PAYMENT CHOICE IS FORCED: at a store that serves BOTH USDC and card, a DRY buy with no " +
+      "payment_method returns reason \"payment_choice_required\" and does NOT quote; present both " +
+      "options to the user and re-call with payment_method \"usdc\" (pay on-chain from the wallet) " +
+      "or \"card\" (hold the reservation for the Stripe Link flow).",
     inputSchema: obj({
       terminal: S,
       items: { type: ["array", "string"] },
@@ -1002,6 +1007,7 @@ export const TOOLS: ToolDef[] = [
       delivery_date: S,
       occasion: S,
       rail: S,
+      payment_method: S,
     }, ["terminal", "items", "ship"]),
     script: "facet-checkout.ts",
     perms: facetPerms,

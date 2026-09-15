@@ -1294,6 +1294,18 @@ export function chooseRail(
   return undefined;
 }
 
+// Whether the store advertises a CARD payment rail, read from its agents.txt
+// manifest. Card is served when MPP-Method is stripe/charge (the Stripe Link
+// path) or any Commerce-Rails entry is a card/* method. This is the signal that
+// turns a silent USDC default into a forced USDC-vs-card choice: see the
+// payment_choice_required gate in cmdBuy. The checkout session itself never
+// advertises card (its payment_handlers map lists only the on-chain handlers),
+// so the manifest is the only source. Pure and exported for offline unit testing.
+export function cardRailAdvertised(commerceRails: string[], mppMethod?: string): boolean {
+  if ((mppMethod ?? "").trim().toLowerCase() === "stripe/charge") return true;
+  return commerceRails.some((r) => /^card\//i.test(r.trim()));
+}
+
 // Validate the checkout's sibling DISPLAY scalars (price_atomic, chain_id) that
 // the skill reads before it ever sees the seller-signed offer: they gate the
 // balance check and, for price, feed BigInt(priceAtomic) downstream. A merchant
@@ -2184,7 +2196,20 @@ async function cmdBuy(flags: Record<string, string | boolean>): Promise<never> {
   // funding source, so blocking the reservation on USDC balance is exactly the
   // coupling this removes. link-cli cannot mint the reservation itself (it carries
   // no Facet KYA), which is why the hold runs through facet_buy here.
-  if (flags.rail === "card") {
+  //
+  // Explicit payment-method choice (usdc | card). This is what the caller passes
+  // to get past the payment_choice_required gate below at a store that serves both
+  // rails: "card" routes to the reservation hold here (same as the legacy
+  // rail: "card"); "usdc" is the acknowledgment that lets the on-chain path
+  // proceed. Absent it (and absent a forced FACET_RAIL), the gate refuses to pick
+  // a rail silently.
+  const paymentMethod = typeof flags["payment-method"] === "string"
+    ? String(flags["payment-method"]).toLowerCase()
+    : undefined;
+  if (paymentMethod !== undefined && paymentMethod !== "usdc" && paymentMethod !== "card") {
+    die(`--payment-method must be "usdc" or "card".`);
+  }
+  if (flags.rail === "card" || paymentMethod === "card") {
     const totalMinor = ucpTotalMinor(session.totals);
     if (totalMinor === null) {
       die("could not read the reservation total from the checkout session (no UCP `total` entry).");
@@ -2204,6 +2229,57 @@ async function cmdBuy(flags: Record<string, string | boolean>): Promise<never> {
   const handlers = session.payment_handlers ?? {};
   const x402cfg = handlers[X402_HANDLER]?.[0]?.config;
   const boson = handlers[BOSON_HANDLER]?.[0]?.config;
+
+  // ---- FORCE the USDC-vs-card payment choice at a store that serves both -------
+  // A store can accept card (Stripe Link via mpp.dev) alongside the on-chain USDC
+  // rail. The checkout session's payment_handlers lists only the on-chain handlers,
+  // so agents.txt is the only place card shows. When the caller has NOT made the
+  // choice explicit (no --payment-method, no forced FACET_RAIL, and not the card
+  // hold handled above), refuse to silently pick USDC: read the Terminal's
+  // agents.txt, and if a card rail is advertised, stop with payment_choice_required
+  // so the agent presents BOTH options and re-calls with --payment-method. This is
+  // the mechanical form of SKILL.md steps 3-4 ("never default to USDC when the
+  // store also serves a card rail without asking"). Fail OPEN: if the manifest read
+  // fails, proceed on the on-chain rail rather than block a real checkout on a
+  // transient error (the session CREATE already reached this Terminal).
+  const railForced = (Deno.env.get("FACET_RAIL") ?? "auto").toLowerCase() !== "auto";
+  if (paymentMethod === undefined && !railForced && (x402cfg !== undefined || boson !== undefined)) {
+    const manifest = await fetchAgentsTxt(`https://${hostOf(base)}/.well-known/agents.txt`);
+    if (manifest.ok) {
+      const mp = manifestParsers(manifest.text);
+      if (cardRailAdvertised(mp.list("Commerce-Rails"), mp.field("MPP-Method"))) {
+        die(
+          "payment method required: this store accepts USDC (from your wallet) or card " +
+            "(via Stripe Link). Ask the buyer which to use, then re-call facet_buy with payment_method.",
+          {
+            reason: "payment_choice_required",
+            payment_methods: ["usdc", "card"],
+            options: [
+              {
+                method: "usdc",
+                label: "USDC from your wallet",
+                detail:
+                  "Pays on the merchant's on-chain rail (Boson escrow or x402-direct), non-custodial, from the chosen wallet.",
+              },
+              {
+                method: "card",
+                label: "Card via Stripe Link",
+                detail:
+                  "Approved in the buyer's Stripe Link app; settles on the merchant's connected Stripe account. Needs a linked card (link-cli onboard).",
+              },
+            ],
+            message:
+              "Present both options to the buyer, then re-call facet_buy with payment_method set to \"usdc\" or \"card\".",
+          },
+        );
+      }
+    } else {
+      note(
+        `could not read agents.txt to check for a card rail (HTTP ${manifest.status}); proceeding on the on-chain rail`,
+      );
+    }
+  }
+
   // Choose the rail to settle. The Terminal advertises every rail it supports in one
   // payment_handlers map plus a `default_rail` naming the merchant's own default (a
   // WooCommerce store defaults to Boson escrow). Honor that default so a Boson-default

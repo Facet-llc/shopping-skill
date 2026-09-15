@@ -292,6 +292,29 @@ Deno.test("facet_buy builds the buy argv and is wired as a commit-then-arm 2-ste
   assert(typeof tool.run === "function", "facet_buy must have the commit-then-arm run handler");
 });
 
+Deno.test("facet_buy exposes payment_method and threads it as --payment-method (the forced choice)", () => {
+  const tool = TOOLS.find((t) => t.name === "facet_buy");
+  assert(tool !== undefined, "facet_buy is not registered");
+  const props = (tool.inputSchema as { properties?: Record<string, unknown> }).properties ?? {};
+  assert(props.payment_method !== undefined, "facet_buy schema must expose payment_method");
+  const argv = tool.build!({
+    terminal: "https://pecanandpetal.facet.llc",
+    items: [{ id: "HCF-CARD", qty: 1 }],
+    ship: {
+      recipient: "T",
+      line1: "1 A St",
+      locality: "Austin",
+      region: "TX",
+      postal_code: "78701",
+      country: "US",
+    },
+    wallet: "default",
+    payment_method: "usdc",
+  });
+  const pi = argv.indexOf("--payment-method");
+  assert(pi >= 0 && argv[pi + 1] === "usdc", "payment_method must be threaded as --payment-method");
+});
+
 // ---- 6. the withdraw wiring maps to the CLI subcommand ---------------------
 
 Deno.test("facet_withdraw builds the withdraw subcommand argv", () => {

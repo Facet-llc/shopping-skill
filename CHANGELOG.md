@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- `facet_buy` now FORCES the USDC-versus-card payment choice at a store that serves both rails, so the agent can no longer silently settle USDC when the store also accepts card. A DRY buy with no `payment_method` (and no `rail: "card"`, no forced `FACET_RAIL`) reads the store's `agents.txt`, and if it advertises a card rail (`MPP-Method: stripe/charge` or any `card/*` in `Commerce-Rails`) alongside the on-chain USDC rail, it refuses to quote and returns `reason: "payment_choice_required"` with both options instead of defaulting to USDC. The agent presents the choice and re-calls with the new `payment_method` argument (`"usdc"` to pay on-chain from the wallet, `"card"` to hold the reservation for the Stripe Link flow). A single-rail store quotes directly (the gate never fires), and the manifest read fails open so a transient error never blocks a real checkout. Adds the exported `cardRailAdvertised` helper (unit-tested both directions), `payment_method` on the `facet_buy` MCP schema and argv, and updates SKILL.md steps 3 to 4, the `facet_buy` tool entry, and the Buying section to document the mechanical gate. Closes the gap where the skill settled USDC without ever offering the card option the store served.
+
 ## [1.4.1] - 2026-09-03
 
 ### Added

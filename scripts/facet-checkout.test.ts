@@ -49,6 +49,7 @@ import {
   CARD_BUYER_PROTECTION,
   mppStripeGate,
   X402_BUYER_PROTECTION,
+  cardRailAdvertised,
   chooseRail,
   type CurrentProduct,
   dedupReceiptIndex,
@@ -528,6 +529,31 @@ Deno.test("chooseRail auto on a single-rail store settles that rail", () => {
 
 Deno.test("chooseRail with no rail advertised is undefined", () => {
   assertEquals(chooseRail("auto", undefined, false, false), undefined);
+});
+
+// ---- cardRailAdvertised: the signal that forces the USDC-vs-card choice ------
+// Regression guard for the defect where the agent settled USDC on a store that
+// also served card, never offering the card option (SKILL.md steps 3-4). The buy
+// path reads this from the store's agents.txt to decide whether to return
+// payment_choice_required. Pure, so tested directly like chooseRail.
+Deno.test("cardRailAdvertised: MPP-Method stripe/charge means a card rail", () => {
+  assertEquals(cardRailAdvertised(["coin/usdc-base"], "stripe/charge"), true);
+  assertEquals(cardRailAdvertised([], "stripe/charge"), true);
+  assertEquals(cardRailAdvertised([], "STRIPE/CHARGE"), true); // case-insensitive
+});
+
+Deno.test("cardRailAdvertised: any card/* in Commerce-Rails means a card rail", () => {
+  assertEquals(cardRailAdvertised(["coin/usdc-base", "card/stripe"], undefined), true);
+  assertEquals(cardRailAdvertised(["card/visa-vic"], undefined), true);
+  assertEquals(cardRailAdvertised(["coin/usdc-base", " card/mastercard-scof "], "evm/charge"), true);
+});
+
+Deno.test("cardRailAdvertised: a USDC-only / on-chain-only store has no card rail", () => {
+  assertEquals(cardRailAdvertised(["coin/usdc-base"], undefined), false);
+  assertEquals(cardRailAdvertised(["coin/usdc-base", "coin/boson-escrow"], "evm/charge"), false);
+  assertEquals(cardRailAdvertised([], undefined), false);
+  // a coin rail whose name merely contains "card" is not a card/* method
+  assertEquals(cardRailAdvertised(["coin/discard-test"], undefined), false);
 });
 
 // ---- errorReason: the nested-error-parse fix -------------------------------
