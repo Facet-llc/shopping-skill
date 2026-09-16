@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "mcpServers": {
+    "facet-shopping": {
+      "command": "bash",
+      "args": ["/absolute/path/to/shopping-skill/muse/facet-shopping.sh"]
+    }
+  }
+}

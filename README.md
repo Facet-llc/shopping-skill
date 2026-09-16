@@ -107,6 +107,21 @@ settles until a second call with `settle: true` and the exact confirmed price), 
 the full post-purchase lifecycle. See [`SKILL.md`](SKILL.md) for the flow the agent
 follows and the complete tool reference.
 
+### Meta Muse Code
+
+To run this on [Meta Muse Code](https://developer.meta.com/ai/products/muse-code/)
+instead of Claude, register the skill and the MCP server in one step from the
+repository root:
+
+```bash
+deno run --allow-env --allow-read --allow-write --allow-run muse/install.ts
+```
+
+Muse has no separate plugin format: a plugin there is a registered skill plus a
+registered MCP server, which is what this repo already is. Full manual and
+one-command instructions, including the `~/.config/muse/settings.json` entry, are
+in [`muse/README.md`](muse/README.md).
+
 ## A reference implementation, not the only path
 
 Facet's rails are open and published: agents.txt discovery, the Facet KYA
