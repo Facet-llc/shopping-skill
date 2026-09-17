@@ -1935,40 +1935,30 @@ Deno.test("card reservation: attaches order_attributes only when present, omits 
 });
 
 // ---- mppStripeGate: the MPP stripe/charge fail-closed guard --------------------------
-// cmdMppCharge draws the challenge, then classifies the method + Stripe sandbox key. The
-// invariant: a card (stripe) charge with no `sk_test_` key FAILS CLOSED (refuse, nothing
-// charged); only a test key proceeds (mint a TEST SPT); a non-stripe method falls through
-// to the evm/charge escrow guard. Offline: a pure classifier.
+// cmdMppCharge draws the challenge, then classifies the method. The invariant: a card
+// (stripe) charge FAILS CLOSED (refuse, nothing charged) because this wallet-based skill
+// holds no card credential; a non-stripe method falls through to the evm/charge escrow
+// guard. A real card settles through the Stripe Link flow, not here. Offline: a pure
+// classifier.
 
-Deno.test("CRITICAL: mppStripeGate fails closed on stripe with no sk_test_ key (never charges)", () => {
-  // No key at all: refuse, naming the env var the caller needs. This is the guard that
-  // stops a card charge the skill cannot legitimately mint.
-  assertEquals(mppStripeGate("stripe", ""), { kind: "refuse", needs: "FACET_STRIPE_SANDBOX_SK" });
-  // A LIVE key is not a sandbox key: still refuse (this skill mints TEST SPTs only).
-  const live = mppStripeGate("stripe", "sk_live_abc123");
-  assertEquals(live, { kind: "refuse", needs: "FACET_STRIPE_SANDBOX_SK" });
-  // A junk / non-key value is refused too.
-  assertEquals(mppStripeGate("stripe", "not-a-key").kind, "refuse");
-});
-
-Deno.test("mppStripeGate: a stripe method with a sk_test_ key proceeds (case-insensitive)", () => {
-  assertEquals(mppStripeGate("stripe", "sk_test_abc123"), { kind: "proceed" });
+Deno.test("CRITICAL: mppStripeGate refuses a stripe charge (this skill never charges a card)", () => {
+  // A card (stripe) charge always fails closed: this wallet-based skill holds no card
+  // credential, so nothing is charged and the caller is sent to the Link flow.
+  assertEquals(mppStripeGate("stripe"), { kind: "refuse" });
   // The method match is case-insensitive, as the live code lowercases it.
-  assertEquals(mppStripeGate("STRIPE", "sk_test_abc123"), { kind: "proceed" });
+  assertEquals(mppStripeGate("STRIPE"), { kind: "refuse" });
 });
 
 Deno.test("mppStripeGate: a non-stripe method falls through to the evm/charge escrow guard", () => {
   // "not_stripe" is the signal cmdMppCharge uses to skip the card branch and run the evm
-  // escrow guard, and it must not depend on the key at all.
-  assertEquals(mppStripeGate("evm", ""), { kind: "not_stripe" });
-  assertEquals(mppStripeGate("evm", "sk_test_abc123"), { kind: "not_stripe" });
+  // escrow guard.
+  assertEquals(mppStripeGate("evm"), { kind: "not_stripe" });
 });
 
 Deno.test("evm/charge still reaches the escrow guard: a Boson merchant over MPP evm is refused", () => {
-  // Item 3, made explicit against the refactor: for a non-stripe (evm) method the gate
-  // returns not_stripe, so control reaches the escrow guard, and that guard refuses an MPP
-  // charge at a Boson-escrow merchant (mppRefusedForEscrow is true). Together these pin
-  // that relocating the guard did NOT open an escrow-bypass on the evm path.
-  assertEquals(mppStripeGate("evm", "").kind, "not_stripe");
+  // For a non-stripe (evm) method the gate returns not_stripe, so control reaches the
+  // escrow guard, and that guard refuses an MPP charge at a Boson-escrow merchant
+  // (mppRefusedForEscrow is true).
+  assertEquals(mppStripeGate("evm").kind, "not_stripe");
   assertEquals(mppRefusedForEscrow({ [BOSON_HANDLER]: [{}], [X402_HANDLER]: [{}] }), true);
 });

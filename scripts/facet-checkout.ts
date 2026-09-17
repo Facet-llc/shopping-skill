@@ -95,7 +95,7 @@ import { compactVerify, createLocalJWKSet } from "npm:jose@5.9.6";
 // `Payment-Receipt` headers mpp.dev uses for the challenge and the receipt.
 import { Mppx } from "npm:mppx@0.8.17/client";
 import { charge as mppEvmCharge } from "npm:mppx@0.8.17/evm/client";
-import { Challenge as MppChallenge, Credential as MppCredential, Receipt as MppReceipt } from "npm:mppx@0.8.17";
+import { Challenge as MppChallenge, Receipt as MppReceipt } from "npm:mppx@0.8.17";
 import { cachePathFor, kyaUsable, provisionKya, readCachedKya } from "./kya-provision.ts";
 import { fillReceiptTemplate, merchantNameFromHost, pubkeyXForKid } from "./render-receipt.ts";
 import { latestTag, SKILL_TAGS_URL, SKILL_VERSION, versionReport } from "./version.ts";
@@ -1128,17 +1128,15 @@ export function mppRefusedForEscrow(paymentHandlers: Record<string, unknown> | u
   return Object.prototype.hasOwnProperty.call(handlers, BOSON_HANDLER);
 }
 
-// Pure classification of an MPP charge's drawn method against the presence of a Stripe
-// sandbox key, extracted from cmdMppCharge so the FAIL-CLOSED decision is unit-tested.
-// "not_stripe" falls through to the evm/charge escrow guard; "refuse" fails closed (no
-// sk_test_ key to mint a TEST SPT, so nothing is charged); "proceed" mints a TEST SPT.
+// Pure classification of an MPP charge's drawn method, extracted from cmdMppCharge so the
+// FAIL-CLOSED decision is unit-tested. "not_stripe" falls through to the evm/charge escrow
+// guard; "refuse" fails closed on a card (stripe) charge, which this wallet-based skill does
+// not settle (a real card goes through the Stripe Link flow).
 export function mppStripeGate(
   method: string,
-  sk: string,
-): { kind: "not_stripe" } | { kind: "refuse"; needs: string } | { kind: "proceed" } {
+): { kind: "not_stripe" } | { kind: "refuse" } {
   if (method.toLowerCase() !== "stripe") return { kind: "not_stripe" };
-  if (!sk.startsWith("sk_test_")) return { kind: "refuse", needs: "FACET_STRIPE_SANDBOX_SK" };
-  return { kind: "proceed" };
+  return { kind: "refuse" };
 }
 
 // Decode a KYA's identity claims (aid, issuer, expiry) from the token's JWT
@@ -1638,109 +1636,18 @@ async function cmdMppCharge(flags: Record<string, string | boolean>): Promise<ne
       body: probeText.slice(0, 400),
     });
   }
-  // Stripe Shared Payment Token path (method=stripe/charge): the merchant settles
-  // this order as a direct, non-custodial card charge on its OWN connected Stripe
-  // account. This skill can complete it in TEST mode by minting a test SPT, when a
-  // Stripe sandbox key (FACET_STRIPE_SANDBOX_SK, an sk_test_ key) is present. The
-  // amount and terms are server-derived from the reservation; the card credential is
-  // an SPT, not this wallet's ERC-3009 authorization, so the buyer wallet never signs
-  // here. Without the key, refuse with a clear message (no key to mint an SPT).
-  const sk = Deno.env.get("FACET_STRIPE_SANDBOX_SK") ?? "";
-  const stripeGate = mppStripeGate(String(challenge.method), sk);
-  if (stripeGate.kind !== "not_stripe") {
-    if (stripeGate.kind === "refuse") {
-      die(
-        `this merchant settles via Stripe (method=${challenge.method}/${challenge.intent}). ` +
-          `Completing it needs a Stripe Shared Payment Token; this skill mints a TEST SPT only when ` +
-          `FACET_STRIPE_SANDBOX_SK (an sk_test_ key) is set. Set it to demo the card path, or use \`buy\`.`,
-        { method: String(challenge.method), intent: String(challenge.intent), needs: stripeGate.needs },
-      );
-    }
-    const sreq = (challenge.request ?? {}) as { amount?: string; currency?: string };
-    const sAmountMinor = String(sreq.amount ?? "");
-    const sCurrency = String(sreq.currency ?? "usd").toLowerCase();
-    const sSummary = {
-      reservation_id: reservationId,
-      mpp_endpoint: mppEndpoint,
-      method: `${challenge.method}/${challenge.intent}`,
-      amount_minor: Number(sAmountMinor),
-      amount_display: (Number(sAmountMinor) / 100).toFixed(2),
-      currency: sCurrency,
-      settles_to: "the merchant's own connected Stripe account",
-      wallet: wallet.label,
-    };
-    if (!settle) {
-      emit({
-        ok: true,
-        mode: "DRY",
-        ...sSummary,
-        signed: false,
-        settled: false,
-        confirm_atomic: Number(sAmountMinor),
-        next: `to settle: mpp-charge --terminal ${base} --reservation-id ${reservationId} --settle --confirm ${sAmountMinor}`,
-        message: `Ready to charge ${(Number(sAmountMinor) / 100).toFixed(2)} ${sCurrency.toUpperCase()} via MPP ` +
-          `stripe/charge to the merchant's connected Stripe account (test mode). Nothing has moved. Confirm the ` +
-          `amount with the user, then settle with --confirm ${sAmountMinor}.`,
-      });
-    }
-    const sConfirm = flags.confirm;
-    if (typeof sConfirm !== "string" || Number(sConfirm) !== Number(sAmountMinor)) {
-      die(
-        `settle refused: --confirm must equal the freshly-challenged amount ${sAmountMinor} (minor units). ` +
-          `Run the DRY mpp-charge again, show the user ${(Number(sAmountMinor) / 100).toFixed(2)} ${sCurrency.toUpperCase()}, then settle.`,
-        { expected_confirm_atomic: Number(sAmountMinor) },
-      );
-    }
-    // Mint a fresh TEST SPT (platform-scoped; redeems on the connected account at
-    // settle), then wrap it in an mppx credential bound to this challenge and the
-    // reservation id, and present it as Authorization: Payment.
-    const grant = await fetch("https://api.stripe.com/v1/test_helpers/shared_payment/granted_tokens", {
-      method: "POST",
-      headers: { authorization: "Basic " + btoa(sk + ":"), "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        payment_method: "pm_card_visa",
-        "usage_limits[currency]": sCurrency,
-        "usage_limits[max_amount]": String(Math.max(Number(sAmountMinor), 100)),
-        "usage_limits[expires_at]": String(Math.floor(Date.now() / 1000) + 3600),
-      }).toString(),
-    });
-    const gj = await grant.json() as Record<string, unknown>;
-    if (grant.status !== 200) {
-      die(`Stripe SPT mint failed (HTTP ${grant.status}).`, { body: JSON.stringify(gj).slice(0, 200) });
-    }
-    const spt = gj.id as string;
-    note(`minted test Stripe SPT (${spt.slice(0, 6)}...); building credential and settling`);
-    const sCred = MppCredential.serialize(MppCredential.from({ challenge, payload: { spt, externalId: reservationId } }));
-    let sRes: Response;
-    try {
-      sRes = await mppx.rawFetch(mppEndpoint, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: sCred },
-        body: JSON.stringify({ reservation_id: reservationId }),
-      });
-    } catch (e) {
-      die(`MPP stripe charge resubmit failed: ${e instanceof Error ? e.message : String(e)}`, { settled: "unconfirmed" });
-    }
-    const sBody = await sRes.text();
-    if (sRes.status < 200 || sRes.status >= 300) {
-      die(`MPP stripe charge refused (HTTP ${sRes.status}).`, { body: sBody.slice(0, 300) });
-    }
-    let sJson: Record<string, unknown> = {};
-    try {
-      sJson = JSON.parse(sBody);
-    } catch { /* keep the raw body in the message below */ }
-    emit({
-      ok: true,
-      mode: "SETTLE",
-      ...sSummary,
-      settled: true,
-      order_id: (sJson.order as { id?: string } | undefined)?.id ?? null,
-      settlement_id: sJson.settlement_id ?? null,
-      settled_at: sJson.settled_at ?? null,
-      payment_receipt: sRes.headers.get("Payment-Receipt") ?? null,
-      message: `Settled ${(Number(sAmountMinor) / 100).toFixed(2)} ${sCurrency.toUpperCase()} as a Stripe card ` +
-        `charge on the merchant's own connected account (test mode).`,
-    });
+  // Stripe Shared Payment Token path (method=stripe/charge): the merchant settles this
+  // order as a direct, non-custodial card charge on its OWN connected Stripe account,
+  // with a card credential (an SPT) this wallet-based skill does not hold. Refuse and
+  // point at the real paths: `buy` for USDC, or the Stripe Link flow for the card.
+  const stripeGate = mppStripeGate(String(challenge.method));
+  if (stripeGate.kind === "refuse") {
+    die(
+      `this merchant settles via Stripe (method=${challenge.method}/${challenge.intent}). ` +
+        `This wallet-based skill does not charge a card: settle USDC through \`buy\`, or pay ` +
+        `the card with the Stripe Link flow (\`link-cli mpp pay\`).`,
+      { method: String(challenge.method), intent: String(challenge.intent) },
+    );
   }
 
   // ---- ESCROW GUARD (evm/charge path only): a USDC-over-MPP charge settles
