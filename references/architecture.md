@@ -141,4 +141,4 @@ touches no secrets.
 Advanced overrides, with safe mainnet defaults: `FACET_EXPECT_CHAIN`,
 `FACET_EXPECT_NETWORK`, `FACET_USDC_ADDRESS`, `FACET_BOSON_ESCROW`, `FACET_RPC`,
 `FACET_MAX_USDC`, `FACET_MAX_USDC_CEILING`, `FACET_ISSUER_URL`,
-`FACET_DIRECTORY_TERMINAL`. Change these only for test networks or a private issuer.
+`FACET_DIRECTORY_TERMINAL`. Change these only for a non-default deployment or a private issuer.

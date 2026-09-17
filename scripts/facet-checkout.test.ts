@@ -226,7 +226,7 @@ Deno.test("x402 wrong chain is refused", () => {
   assertThrows(() => assertX402Terms({ ...x402Adv(), chainId: 1 }, x402Expect()), Error, "expected");
 });
 
-Deno.test("x402 wrong EIP-712 domain is refused (testnet domain on mainnet)", () => {
+Deno.test("x402 wrong EIP-712 domain name is refused", () => {
   assertThrows(() => assertX402Terms({ ...x402Adv(), domainName: "USDC" }, x402Expect()), Error, "domain");
 });
 
@@ -303,7 +303,7 @@ Deno.test("MPP malformed recipient is refused (no valid recipient)", () => {
 });
 
 Deno.test("MPP wrong chain is refused", () => {
-  assertThrows(() => assertMppTerms({ ...mppChal(), chainId: 84532 }, mppExpect()), Error, "expected 8453");
+  assertThrows(() => assertMppTerms({ ...mppChal(), chainId: 1 }, mppExpect()), Error, "expected 8453");
 });
 
 Deno.test("MPP swapped currency (not USDC) is refused", () => {
@@ -452,7 +452,7 @@ Deno.test("decodeBosonCommit extracts the buyer ERC-3009 auth and the seller sig
   const commit = btoa(JSON.stringify({
     x402Version: 2,
     scheme: "escrow",
-    network: "eip155:84532",
+    network: "eip155:8453",
     payload: {
       action: "boson-createOfferAndCommit",
       offerRef: { sellerSig: "0xseller123" },
@@ -1093,7 +1093,7 @@ Deno.test("withdraw EIP-712: the digest changes when any signed field changes (n
   assert(h({ ...base, nonce: 43n }) !== baseHash, "nonce is not bound");
   assert(h({ ...base, amount: 1_000_001n }) !== baseHash, "amount is not bound");
   assert(h({ ...base, entityId: 18n }) !== baseHash, "entityId is not bound");
-  assert(h({ ...base, chainId: 84532 }) !== baseHash, "chain (salt) is not bound");
+  assert(h({ ...base, chainId: 1 }) !== baseHash, "chain (salt) is not bound");
 });
 
 // ---- signBosonAction: the buyer's gasless post-commit meta-txs -------------
