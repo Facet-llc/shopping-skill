@@ -121,15 +121,13 @@ import {
 } from "./wallet.ts";
 
 // ---- network profile: one flag (FACET_NETWORK) selects a coherent set of chain
-// defaults, so a testnet run needs no pile of env vars. `base` is Base mainnet
-// (the default); `base-sepolia` is the sandbox testnet plane. Every value below
-// still honors its individual FACET_* override when set; the profile only
-// supplies the default. `usdcDomainName` is the token contract's real EIP-712
-// name (Base mainnet USDC is "USD Coin", Base Sepolia USDC is "USDC"): a wrong
-// name makes the ERC-3009 signature recover the wrong signer, which the Terminal
-// reads as "buyer identity not bound to the paying wallet". `originationSuffixes`
-// is empty for the sandbox because the sandbox platform serves no origination
-// endpoint, so a sandbox target checks out buyer-direct.
+// defaults. `base` is Base mainnet, the default and the only network this public
+// client ships. Every value below still honors its individual FACET_* override
+// when set; the profile only supplies the default. `usdcDomainName` is the token
+// contract's real EIP-712 name (Base mainnet USDC is "USD Coin"): a wrong name
+// makes the ERC-3009 signature recover the wrong signer, which the Terminal reads
+// as "buyer identity not bound to the paying wallet". `originationSuffixes` scopes
+// which hosts check out through the Facet origination endpoint.
 interface NetworkProfile {
   readonly chain: number;
   readonly network: string;
@@ -148,15 +146,6 @@ const NETWORK_PROFILES: Record<string, NetworkProfile> = {
     usdcDomainName: "USD Coin",
     platform: "https://api.facet.llc",
     originationSuffixes: ".facet.llc",
-  },
-  "base-sepolia": {
-    chain: 84532,
-    network: "base-sepolia",
-    usdc: "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
-    rpc: "https://sepolia.base.org",
-    usdcDomainName: "USDC",
-    platform: "https://api.sandbox.facet.llc",
-    originationSuffixes: ".sandbox.facet.llc",
   },
 };
 const PROFILE = NETWORK_PROFILES[(Deno.env.get("FACET_NETWORK") ?? "base").toLowerCase()] ??
@@ -177,7 +166,6 @@ export const EXPECT_NETWORK = Deno.env.get("FACET_EXPECT_NETWORK") ?? PROFILE.ne
 // Default to the Diamond for the expected chain; override deliberately via env.
 const BOSON_ESCROW_BY_CHAIN: Record<number, string> = {
   8453: "0x59A4C19b55193D5a2EAD0065c54af4d516E18Cb5", // Base mainnet Diamond
-  84532: "0x7de418a7ce94debd057c34ebac232e7027634ade", // Base Sepolia Diamond
 };
 const BOSON_ESCROW = (Deno.env.get("FACET_BOSON_ESCROW") ?? BOSON_ESCROW_BY_CHAIN[EXPECT_CHAIN] ?? "").toLowerCase();
 const TOKEN_DOMAIN_NAME = Deno.env.get("FACET_TOKEN_DOMAIN_NAME") ?? PROFILE.usdcDomainName;

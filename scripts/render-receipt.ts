@@ -139,7 +139,6 @@ function prettyRail(rail: string): string {
   return ({
     "coin/boson-escrow": "Boson escrow",
     "coin/usdc-base": "x402 direct",
-    "coin/usdc-base-sepolia": "x402 direct",
     "card/stripe": "Card (Stripe)",
     "coin/usdc-stripe": "x402 direct",
   } as Record<string, string>)[rail] ?? (rail || "settlement");
@@ -162,7 +161,7 @@ function chipsHtml(st: Record<string, unknown>): string {
   const live = st.livemode === true;
   return [
     `<span class="chip">${esc(prettyRail(String(st.rail ?? "")))}</span>`,
-    `<span class="chip ok">${live ? "Live" : "Test"} &#183; ${live ? "Base mainnet" : "Base Sepolia"}</span>`,
+    `<span class="chip ok">${live ? "Live" : "Test"} &#183; Base mainnet</span>`,
     `<span class="chip">USDC</span>`,
   ].join("\n        ");
 }
@@ -298,7 +297,7 @@ function settlementKv(claims: Record<string, unknown>, st: Record<string, unknow
       "Livemode",
       st.livemode === true
         ? card ? "true &#183; real card charge" : "true &#183; real USDC on Base"
-        : card ? "false &#183; Stripe test mode" : "false &#183; testnet",
+        : card ? "false &#183; Stripe" : "false",
     ),
   ];
   return rows.filter((r) => r !== "").join("\n        ");

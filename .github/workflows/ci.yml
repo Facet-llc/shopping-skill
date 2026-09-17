@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   verify:
-    name: lint, type-check, test
+    name: lint, type-check, test, mainnet-clean
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -30,3 +30,11 @@ jobs:
 
       - name: Test
         run: deno task test
+
+      - name: Mainnet-clean gate (no non-production network refs in the published skill)
+        run: |
+          if git grep -nEi 'sepolia|84532|testnet' -- ':!.github/**'; then
+            echo "::error::A non-production network reference is present. This public skill is mainnet-only; the sandbox plane lives in shopping-skill-dev."
+            exit 1
+          fi
+          echo "mainnet-clean: no non-production network references in the published skill"
